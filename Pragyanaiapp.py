@@ -10,7 +10,6 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
-from bson.objectobjectid import ObjectId
 from datetime import datetime
 
 # -------------------------
