@@ -10,6 +10,7 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
 from bson.objectid import ObjectId
 from datetime import datetime
 
@@ -168,6 +169,40 @@ class DatabaseManager:
                 resume['status'] = 'Pending' 
         return resumes
         
+    # --- Vendor Management (New) ---
+    def save_vendor(self, vendor_data):
+        if not self.is_connected(): return None
+        collection = self.db['vendors']
+        
+        # Check for vendor with the same name/contact
+        existing_vendor = collection.find_one({
+            '$or': [{'name': vendor_data['name']}, {'contact_email': vendor_data['contact_email']}]
+        })
+        
+        vendor_data['updated_at'] = datetime.utcnow()
+        if 'status' not in vendor_data:
+            vendor_data['status'] = 'Pending'
+            
+        if existing_vendor:
+            # Update existing vendor data
+            collection.update_one({'_id': existing_vendor['_id']}, {'$set': vendor_data})
+            return existing_vendor['_id']
+        else:
+            vendor_data['created_at'] = datetime.utcnow()
+            result = collection.insert_one(vendor_data)
+            return result.inserted_id
+
+    def get_vendors(self):
+        if not self.is_connected(): return []
+        collection = self.db['vendors']
+        vendors = list(collection.find({}).sort('created_at', -1))
+        for vendor in vendors:
+            vendor['_id'] = str(vendor['_id'])
+            if 'status' not in vendor:
+                vendor['status'] = 'Pending' 
+        return vendors
+
+        
     # --- Match Results (Admin and Candidate) ---
     def save_match_result(self, result_data, user_role):
         if not self.is_connected(): return None
@@ -198,6 +233,7 @@ class DatabaseManager:
         self.db.admin_resumes.drop()
         self.db.admin_match_results.drop()
         self.db.candidate_match_results.drop()
+        self.db.vendors.drop() # <-- NEW: Drop vendors collection
         
         # Reset session state lists (will be reloaded on next dashboard entry)
         if 'admin_jd_list' in st.session_state: st.session_state.admin_jd_list = []
@@ -205,6 +241,8 @@ class DatabaseManager:
         if 'admin_match_results' in st.session_state: st.session_state.admin_match_results = []
         if 'candidate_jd_list' in st.session_state: st.session_state.candidate_jd_list = []
         if 'candidate_match_results' in st.session_state: st.session_state.candidate_match_results = []
+        if 'vendor_list' in st.session_state: st.session_state.vendor_list = []
+
 
 # -------------------------
 # Utility: Navigation Manager
@@ -637,12 +675,18 @@ def admin_dashboard():
         st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
     # Resumes must be reloaded to get the latest status
     st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
-
+    
+    # NEW: Initialize Vendor list
+    if "vendor_list" not in st.session_state:
+        st.session_state.vendor_list = st.session_state.db.get_vendors() # <-- NEW
+    
     if "admin_match_results" not in st.session_state:
         st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
     
-    # NEW: Added Candidate Approval tab
-    tab_jd, tab_analysis, tab_approval, tab_settings = st.tabs(["📄 Job Description Management", "📊 Resume Analysis", "✅ Candidate Approval", "⚙️ Settings"])
+    # NEW: Added Vendors Approval tab
+    tab_jd, tab_analysis, tab_candidate_approval, tab_vendor_approval, tab_settings = st.tabs(
+        ["📄 JD Management", "📊 Resume Analysis", "✅ Candidate Approval", "🤝 Vendors Approval", "⚙️ Settings"]
+    )
 
     # --- TAB 1: JD Management ---
     with tab_jd:
@@ -930,15 +974,15 @@ def admin_dashboard():
                     st.markdown(item['full_analysis'])
 
     
-    # --- TAB 3: Candidate Approval (NEW FEATURE) ---
-    with tab_approval:
+    # --- TAB 3: Candidate Approval ---
+    with tab_candidate_approval:
         st.subheader("Review and Approve Candidate Resumes")
         st.markdown("Use this list to set the review status for analyzed resumes.")
 
         # Re-load resumes to ensure we have the latest status from DB
-        # This is essential to show the current status immediately after an update
         if st.session_state.db.is_connected():
-            st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+            # Only refresh this list if a reload event happens, otherwise rely on session state
+            st.session_state.resumes_to_analyze = st.session_state.db.get_resumes() 
         
         resumes_list = st.session_state.resumes_to_analyze
 
@@ -975,14 +1019,14 @@ def admin_dashboard():
                 
                 with col_button:
                     # Function to update the status in MongoDB
-                    def update_resume_status(r_id, status):
+                    def update_resume_status(r_id, status, r_name):
                         if st.session_state.db.is_connected():
                             # Update only the status field in the admin_resumes collection
                             st.session_state.db.db.admin_resumes.update_one(
                                 {'_id': ObjectId(r_id)},
                                 {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
                             )
-                            st.toast(f"Status for {resume_name} updated to {status}!")
+                            st.toast(f"Status for {r_name} updated to {status}!")
                         st.rerun() # Rerun to refresh the list and show the new status
 
                     # Update button with callback
@@ -992,7 +1036,7 @@ def admin_dashboard():
                             "Update",
                             key=f"update_btn_{resume_id}",
                             on_click=update_resume_status,
-                            args=(resume_id, new_status)
+                            args=(resume_id, new_status, resume_name)
                         )
                     else:
                         # Placeholder to keep alignment consistent
@@ -1001,7 +1045,99 @@ def admin_dashboard():
                 st.markdown("---") # Separator between resumes
 
     
-    # --- TAB 4: Settings ---
+    # --- TAB 4: Vendors Approval (NEW FEATURE) ---
+    with tab_vendor_approval:
+        st.subheader("Manage and Approve Vendors/Hiring Companies")
+        st.markdown("Vendors (Hiring Companies) must be approved before they can post jobs.")
+        
+        # Vendor Input Form
+        with st.expander("➕ Manually Add New Vendor"):
+            with st.form("add_vendor_form"):
+                vendor_name = st.text_input("Vendor Company Name", key="vendor_name_input")
+                vendor_contact = st.text_input("Contact Email", key="vendor_contact_input")
+                vendor_industry = st.text_input("Industry/Focus", key="vendor_industry_input")
+                
+                submitted = st.form_submit_button("Submit Vendor for Approval")
+                
+                if submitted:
+                    if vendor_name and vendor_contact:
+                        vendor_data = {
+                            "name": vendor_name,
+                            "contact_email": vendor_contact,
+                            "industry": vendor_industry,
+                            "status": "Pending", # Initial status
+                        }
+                        st.session_state.db.save_vendor(vendor_data)
+                        # Refresh vendor list after saving
+                        st.session_state.vendor_list = st.session_state.db.get_vendors()
+                        st.success(f"Vendor '{vendor_name}' added successfully and set to Pending.")
+                        st.rerun()
+                    else:
+                        st.error("Vendor Name and Contact Email are required.")
+
+        st.markdown("#### Vendor Status List")
+        
+        # Reload vendor list every time the tab is active
+        st.session_state.vendor_list = st.session_state.db.get_vendors()
+            
+        vendors_list = st.session_state.vendor_list
+
+        if not vendors_list:
+            st.info("No vendors have been added for review yet.")
+        else:
+            # Define status options for vendors
+            VENDOR_STATUS_OPTIONS = ["Pending", "Approved", "Onboarding", "Rejected"]
+
+            for vendor_data in vendors_list:
+                vendor_id = vendor_data['_id']
+                current_status = vendor_data.get('status', 'Pending') 
+                vendor_name = vendor_data.get('name', 'N/A')
+                
+                # Layout
+                col_name, col_status, col_button = st.columns([3, 2, 1])
+
+                with col_name:
+                    st.write(f"**Vendor:** {vendor_name}")
+                    st.write(f"**Contact:** {vendor_data.get('contact_email', 'N/A')}")
+                    st.write(f"**Current Status:** {current_status}")
+
+                with col_status:
+                    # Use unique key for each dropdown
+                    new_status = st.selectbox(
+                        "Set Status",
+                        VENDOR_STATUS_OPTIONS,
+                        index=VENDOR_STATUS_OPTIONS.index(current_status) if current_status in VENDOR_STATUS_OPTIONS else 0,
+                        key=f"vendor_status_select_{vendor_id}",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_button:
+                    # Function to update the status in MongoDB
+                    def update_vendor_status(v_id, status, v_name):
+                        if st.session_state.db.is_connected():
+                            st.session_state.db.db.vendors.update_one(
+                                {'_id': ObjectId(v_id)},
+                                {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
+                            )
+                            st.toast(f"Status for {v_name} updated to {status}!")
+                            st.session_state.vendor_list = st.session_state.db.get_vendors() # Reload
+                        st.rerun() # Rerun to refresh the list and show the new status
+
+                    # Update button
+                    if new_status != current_status:
+                        st.button(
+                            "Update",
+                            key=f"vendor_update_btn_{vendor_id}",
+                            on_click=update_vendor_status,
+                            args=(vendor_id, new_status, vendor_name)
+                        )
+                    else:
+                        st.button("Update", key=f"vendor_update_btn_disabled_{vendor_id}", disabled=True)
+                
+                st.markdown("---")
+
+
+    # --- TAB 5: Settings ---
     with tab_settings:
         st.subheader("Database Settings")
         st.warning("Use these options with caution, as they affect persistent data.")
@@ -1009,6 +1145,7 @@ def admin_dashboard():
         if st.button("🔄 Reload All Data from MongoDB", key="reload_db_admin"):
             st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
             st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+            st.session_state.vendor_list = st.session_state.db.get_vendors()
             st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
             st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
             st.session_state.candidate_match_results = st.session_state.db.get_match_results('candidate')
@@ -1431,6 +1568,7 @@ def main():
         # They are initialized here but populated inside the dashboards to ensure they are fresh
         st.session_state.admin_jd_list = []
         st.session_state.resumes_to_analyze = []
+        st.session_state.vendor_list = [] # <-- NEW
         st.session_state.admin_match_results = []
         st.session_state.candidate_jd_list = []
         st.session_state.candidate_match_results = []
