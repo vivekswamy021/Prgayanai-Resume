@@ -10,6 +10,7 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
 from bson.objectid import ObjectId
 from datetime import datetime
 
@@ -222,6 +223,42 @@ class DatabaseManager:
             if 'created_at' in result:
                 result['created_at_str'] = result['created_at'].strftime("%Y-%m-%d %H:%M")
         return results
+
+    # --- NEW: Platform Metrics ---
+    def get_platform_metrics(self):
+        """Calculates key counts for the platform."""
+        if not self.is_connected():
+            return {
+                "total_candidates": 0,
+                "total_jds": 0,
+                "total_vendors": 0,
+                "no_of_applications": 0,
+                "no_of_social_media_posts": 0 # Placeholder for future feature
+            }
+
+        # Count unique candidates (resumes)
+        total_candidates = self.db['admin_resumes'].count_documents({})
+        
+        # Count all job descriptions (Admin and Candidate)
+        total_jds = self.db['admin_jds'].count_documents({}) + self.db['candidate_jds'].count_documents({})
+        
+        # Count total vendors
+        total_vendors = self.db['vendors'].count_documents({})
+        
+        # Count total match results (applications/analyses run)
+        no_of_applications = self.db['admin_match_results'].count_documents({}) + self.db['candidate_match_results'].count_documents({})
+
+        # Social Media Posts (Placeholder for future feature)
+        no_of_social_media_posts = 0 # Assuming 0 for now as the feature is not implemented
+
+        return {
+            "total_candidates": total_candidates,
+            "total_jds": total_jds,
+            "total_vendors": total_vendors,
+            "no_of_applications": no_of_applications,
+            "no_of_social_media_posts": no_of_social_media_posts
+        }
+
 
     # --- Utility: Clear all data (for demo/admin) ---
     def clear_all_data(self):
@@ -692,9 +729,9 @@ def admin_dashboard():
         if "admin_match_results" not in st.session_state:
             st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
     
-    # NEW: Added Vendors Approval tab
-    tab_jd, tab_analysis, tab_candidate_approval, tab_vendor_approval, tab_settings = st.tabs(
-        ["📄 JD Management", "📊 Resume Analysis", "✅ Candidate Approval", "🤝 Vendors Approval", "⚙️ Settings"]
+    # NEW: Added Vendors Approval tab and Statistics tab
+    tab_jd, tab_analysis, tab_candidate_approval, tab_vendor_approval, tab_metrics, tab_settings = st.tabs(
+        ["📄 JD Management", "📊 Resume Analysis", "✅ Candidate Approval", "🤝 Vendors Approval", "📈 Statistics", "⚙️ Settings"]
     )
 
     # --- TAB 1: JD Management ---
@@ -1170,9 +1207,52 @@ def admin_dashboard():
                         st.button("Update", key=f"vendor_update_btn_disabled_{vendor_id}", disabled=True)
                 
                 st.markdown("---")
+                
+    # --- TAB 5: Statistics (NEW TAB) ---
+    with tab_metrics:
+        st.subheader("Platform Metrics")
+        
+        if not st.session_state.db.is_connected():
+            st.error("Cannot load metrics: Database is not connected.")
+            metrics = st.session_state.db.get_platform_metrics() # Returns 0s if disconnected
+        else:
+            # Get the metrics
+            metrics = st.session_state.db.get_platform_metrics()
+
+        # Display Metrics in columns (cards)
+        col_cands, col_jds, col_vendors, col_apps, col_social = st.columns(5)
+        
+        # Helper function for metric display (to keep it DRY)
+        def display_metric(column, title, value):
+            with column:
+                st.markdown(
+                    f"""
+                    <div style='
+                        border: 1px solid #ccc; 
+                        border-radius: 5px; 
+                        padding: 10px; 
+                        text-align: center;
+                        margin-bottom: 10px;
+                        background-color: #f9f9f9;
+                    '>
+                        <p style='font-size: 14px; color: #555; margin-bottom: 0;'>{title}</p>
+                        <h3 style='font-size: 30px; margin-top: 0; color: #007bff;'>{value}</h3>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+
+        display_metric(col_cands, "Total Resumes (Candidates)", metrics["total_candidates"])
+        display_metric(col_jds, "Total JDs (Admin + Candidate)", metrics["total_jds"])
+        display_metric(col_vendors, "Total Vendors", metrics["total_vendors"])
+        display_metric(col_apps, "Total Applications/Matches Run", metrics["no_of_applications"])
+        display_metric(col_social, "No. of Social Media Posts", metrics["no_of_social_media_posts"])
+        
+        st.markdown("---")
+        st.info("Note: 'Total Resumes' counts unique resumes uploaded by Admin for analysis. 'Total JDs' aggregates JDs added by both Admin and Candidates.")
 
 
-    # --- TAB 5: Settings ---
+    # --- TAB 6: Settings ---
     with tab_settings:
         st.subheader("Database Settings")
         st.warning("Use these options with caution, as they affect persistent data.")
@@ -1542,7 +1622,7 @@ def candidate_dashboard():
                             "overall_score": "Error",
                             "skills_percent": "Error",
                             "experience_percent": "Error", 
-                            "education_percent": "Error",   
+                            "education_percent": "Error", 
                             "full_analysis": f"Error running analysis for {jd_name}: {e}\n{traceback.format_exc()}",
                             "resume_name": resume_name
                         }
