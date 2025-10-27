@@ -10,6 +10,7 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
 from bson.objectid import ObjectId
 from datetime import datetime
 
@@ -69,7 +70,6 @@ class DatabaseManager:
                 client.admin.command('ping') 
                 
                 # CRITICAL FIX: Check for default database before returning
-                # This explicitly raises the ConfigurationError if the DB name is missing
                 client.get_default_database() 
                 
                 return client
@@ -140,9 +140,17 @@ class DatabaseManager:
         resume_name = resume_data['name']
         resume_data['updated_at'] = datetime.utcnow()
 
+        # Add default status if not present
+        if 'status' not in resume_data:
+            resume_data['status'] = 'Pending'
+        
         # Check for resume with the same name
         existing_resume = collection.find_one({'name': resume_name})
         if existing_resume:
+            # Preserve existing 'status' if not explicitly provided in resume_data
+            if 'status' in existing_resume:
+                resume_data['status'] = existing_resume['status']
+            
             collection.update_one({'_id': existing_resume['_id']}, {'$set': resume_data})
             return existing_resume['_id']
         else:
@@ -156,6 +164,9 @@ class DatabaseManager:
         resumes = list(collection.find({}).sort('created_at', -1))
         for resume in resumes:
             resume['_id'] = str(resume['_id'])
+            # Ensure status is present for the approval tab
+            if 'status' not in resume:
+                resume['status'] = 'Pending' 
         return resumes
         
     # --- Match Results (Admin and Candidate) ---
@@ -625,12 +636,14 @@ def admin_dashboard():
     # Initialize Admin session state variables and load from DB
     if "admin_jd_list" not in st.session_state:
         st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
-    if "resumes_to_analyze" not in st.session_state:
-        st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+    # Resumes must be reloaded to get the latest status
+    st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+
     if "admin_match_results" not in st.session_state:
         st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
     
-    tab_jd, tab_analysis, tab_settings = st.tabs(["📄 Job Description Management", "📊 Resume Analysis", "⚙️ Settings"])
+    # NEW: Added Candidate Approval tab
+    tab_jd, tab_analysis, tab_approval, tab_settings = st.tabs(["📄 Job Description Management", "📊 Resume Analysis", "✅ Candidate Approval", "⚙️ Settings"])
 
     # --- TAB 1: JD Management ---
     with tab_jd:
@@ -790,7 +803,8 @@ def admin_dashboard():
         st.markdown("#### Resumes Available for Analysis (Loaded from DB):")
         if st.session_state.resumes_to_analyze:
              for resume_data in st.session_state.resumes_to_analyze:
-                 st.write(f"- **{resume_data['name']}** (ID: {resume_data['_id'][:6]}...)")
+                 status_badge = f"({resume_data.get('status', 'Pending')})"
+                 st.write(f"- **{resume_data['name']}** {status_badge} (ID: {resume_data['_id'][:6]}...)")
         else:
              st.info("No resumes available.")
         
@@ -801,11 +815,11 @@ def admin_dashboard():
 
         if not st.session_state.resumes_to_analyze:
             st.info("Upload and parse resumes first to enable analysis.")
-            return
+            # return # Keep running to show JD selection part
 
         if not st.session_state.admin_jd_list:
             st.error("Please add at least one Job Description in the 'JD Management' tab before running an analysis.")
-            return
+            # return # Keep running to show resume part
 
         jd_options = {item['name']: item['content'] for item in st.session_state.admin_jd_list}
         selected_jd_name = st.selectbox("Select JD for Matching", list(jd_options.keys()), key="select_jd_admin")
@@ -816,6 +830,10 @@ def admin_dashboard():
             
             if not selected_jd_content:
                 st.error("Selected JD content is empty.")
+                return
+            
+            if not st.session_state.resumes_to_analyze:
+                st.error("No resumes available to analyze.")
                 return
 
             with st.spinner(f"Matching {len(st.session_state.resumes_to_analyze)} resumes against '{selected_jd_name}'..."):
@@ -828,7 +846,6 @@ def admin_dashboard():
                         fit_output = evaluate_jd_fit(selected_jd_content, parsed_json)
                         
                         # --- ENHANCED EXTRACTION LOGIC (FIXED) ---
-                        # Robust Regexes to handle single-line LLM output
                         overall_score_match = re.search(r'Overall Fit Score:\s*(\d+)\s*/10', fit_output, re.IGNORECASE)
                         section_analysis_match = re.search(
                              r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', 
@@ -912,8 +929,80 @@ def admin_dashboard():
                 header_text = f"Report for **{item['resume_name']}** against {item['jd_name']} (Score: **{item['overall_score']}/10** | S: **{item.get('skills_percent', 'N/A')}%** | E: **{item.get('experience_percent', 'N/A')}%** | Edu: **{item.get('education_percent', 'N/A')}%**)"
                 with st.expander(header_text):
                     st.markdown(item['full_analysis'])
-                    
-    # --- TAB 3: Settings ---
+
+    
+    # --- TAB 3: Candidate Approval (NEW FEATURE) ---
+    with tab_approval:
+        st.subheader("Review and Approve Candidate Resumes")
+        st.markdown("Use this list to set the review status for analyzed resumes.")
+
+        # Re-load resumes to ensure we have the latest status from DB
+        # This is essential to show the current status immediately after an update
+        if st.session_state.db.is_connected():
+            st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+        
+        resumes_list = st.session_state.resumes_to_analyze
+
+        if not resumes_list:
+            st.info("No resumes have been uploaded and parsed for review yet.")
+        else:
+            st.markdown("#### Resume Status List")
+            
+            # Define status options
+            STATUS_OPTIONS = ["Pending", "Approved", "Rejected", "Contacted"]
+
+            for resume_data in resumes_list:
+                resume_id = resume_data['_id']
+                # Ensure a default status is always present
+                current_status = resume_data.get('status', 'Pending') 
+                resume_name = resume_data.get('name', 'N/A')
+                
+                # Layout matching the screenshot
+                col_name, col_status, col_button = st.columns([3, 2, 1])
+
+                with col_name:
+                    st.write(f"**Resume:** {resume_name}")
+                    st.write(f"**Current Status:** {current_status}")
+
+                with col_status:
+                    # Use unique key for each dropdown
+                    new_status = st.selectbox(
+                        "Set Status",
+                        STATUS_OPTIONS,
+                        index=STATUS_OPTIONS.index(current_status) if current_status in STATUS_OPTIONS else 0,
+                        key=f"status_select_{resume_id}",
+                        label_visibility="collapsed" # Hides the label for clean layout
+                    )
+                
+                with col_button:
+                    # Function to update the status in MongoDB
+                    def update_resume_status(r_id, status):
+                        if st.session_state.db.is_connected():
+                            # Update only the status field in the admin_resumes collection
+                            st.session_state.db.db.admin_resumes.update_one(
+                                {'_id': ObjectId(r_id)},
+                                {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
+                            )
+                            st.toast(f"Status for {resume_name} updated to {status}!")
+                        st.rerun() # Rerun to refresh the list and show the new status
+
+                    # Update button with callback
+                    # Only show the update button if the status has actually changed
+                    if new_status != current_status:
+                        st.button(
+                            "Update",
+                            key=f"update_btn_{resume_id}",
+                            on_click=update_resume_status,
+                            args=(resume_id, new_status)
+                        )
+                    else:
+                        # Placeholder to keep alignment consistent
+                        st.button("Update", key=f"update_btn_disabled_{resume_id}", disabled=True)
+                
+                st.markdown("---") # Separator between resumes
+
+    
+    # --- TAB 4: Settings ---
     with tab_settings:
         st.subheader("Database Settings")
         st.warning("Use these options with caution, as they affect persistent data.")
@@ -1208,11 +1297,11 @@ def candidate_dashboard():
 
         if not st.session_state.parsed:
             st.warning("Please **upload and parse your resume** in the sidebar first.")
-            return
+            # return
 
         if not st.session_state.candidate_jd_list:
             st.error("Please **add Job Descriptions** in the 'JD Management' tab (Tab 4) before running batch analysis.")
-            return
+            # return
             
         if st.button(f"Run Batch Match Against {len(st.session_state.candidate_jd_list)} JDs"):
             
@@ -1229,7 +1318,6 @@ def candidate_dashboard():
                         fit_output = evaluate_jd_fit(jd_content, parsed_json)
                         
                         # --- ENHANCED EXTRACTION LOGIC (FIXED) ---
-                        # Robust Regexes to handle single-line LLM output
                         overall_score_match = re.search(r'Overall Fit Score:\s*(\d+)\s*/10', fit_output, re.IGNORECASE)
                         section_analysis_match = re.search(
                              r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', 
@@ -1341,6 +1429,7 @@ def main():
         st.session_state.jd_fit_output = ""
         
         # Reset lists if a hard restart occurs, lists will be loaded from DB in respective dashboards
+        # They are initialized here but populated inside the dashboards to ensure they are fresh
         st.session_state.admin_jd_list = []
         st.session_state.resumes_to_analyze = []
         st.session_state.admin_match_results = []
