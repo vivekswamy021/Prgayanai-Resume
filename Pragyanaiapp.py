@@ -10,6 +10,8 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
+from bson.objectid import ObjectId # <<< CRITICAL FIX: Ensure ObjectId is imported correctly
 from datetime import datetime
 
 # -------------------------
@@ -1121,6 +1123,7 @@ def admin_dashboard():
 
             # Function to update the status in MongoDB (defined inside the dashboard scope)
             def update_resume_status(r_id, status, r_name):
+                # NOTE: ObjectId is available here due to the corrected global import
                 if st.session_state.db.is_connected():
                     # 1. Update the status in the MongoDB database (THE SAVE OPERATION)
                     st.session_state.db.db.admin_resumes.update_one(
