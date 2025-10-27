@@ -10,6 +10,7 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
 from bson.objectid import ObjectId
 from datetime import datetime
 
@@ -28,13 +29,13 @@ question_section_options = ["skills","experience", "certifications", "education"
 load_dotenv()
 
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
-MONGODB_URI = os.getenv('MONGODB_URI') # NEW: Load MongoDB URI
+MONGODB_URI = os.getenv('MONGODB_URI') 
 
+# --- CRITICAL ENVIRONMENT VARIABLE CHECK ---
 if not GROQ_API_KEY:
     st.error(
         "🚨 FATAL ERROR: GROQ_API_KEY environment variable not set. "
-        "Please ensure a '.env' file exists in the script directory with this line: "
-        "GROQ_API_KEY=\"YOUR_KEY_HERE\""
+        "Please ensure a '.env' file exists in the script directory with your key."
     )
     st.stop()
 
@@ -44,6 +45,7 @@ if not MONGODB_URI:
         "The application requires a MongoDB connection. Please check your '.env' file."
     )
     st.stop()
+# --- END ENVIRONMENT VARIABLE CHECK ---
 
 # Initialize Groq Client
 client = Groq(api_key=GROQ_API_KEY)
@@ -63,20 +65,42 @@ class DatabaseManager:
         def init_connection(mongo_uri):
             try:
                 # Add server selection timeout to prevent infinite hangs
-                client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-                # Attempt a quick command to verify connection
+                client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5500)
+                # Attempt a quick command to verify connection and configuration
                 client.admin.command('ping') 
+                
+                # CRITICAL FIX: Check for default database before returning
+                # This explicitly raises the ConfigurationError if the DB name is missing
+                client.get_default_database() 
+                
                 return client
-            except Exception as e:
-                # Log the connection failure
+            except ConfigurationError as e:
+                # Catch the specific error about the missing database name
+                print(f"MongoDB Configuration Error: {e}")
+                st.error(
+                    "❌ MongoDB Configuration Error: The connection string is missing the database name. "
+                    "Ensure your MONGODB_URI format is correct: "
+                    "`mongodb+srv://user:pass@cluster.mongodb.net/DATABASE_NAME?query`"
+                )
+                return None
+            except (PyMongoConnectionError, Exception) as e:
+                # Catch general connection errors (auth, network, etc.)
+                error_detail = str(e)
+                if 'bad auth' in error_detail:
+                    st.error("❌ MongoDB Connection Error: Authentication failed (Bad Auth). Check MONGODB_URI username and password.")
+                else:
+                    st.error(f"❌ MongoDB Connection Error: Failed to connect. Check MONGODB_URI and network access. Error: {e}")
                 print(f"MongoDB Connection Error: {e}")
-                st.error(f"MongoDB Connection Error: Failed to connect. Check MONGODB_URI and network access. Error: {e}")
                 return None
 
         self.client = init_connection(uri)
         if self.client:
-            # Get the default database name specified in the connection string
-            self.db = self.client.get_default_database()
+            try:
+                # Get the default database name specified in the connection string
+                self.db = self.client.get_default_database()
+            except ConfigurationError:
+                # This should be caught by init_connection, but included for robustness
+                self.db = None
         
     def is_connected(self):
         return self.client is not None and self.db is not None
@@ -166,7 +190,7 @@ class DatabaseManager:
         self.db.admin_match_results.drop()
         self.db.candidate_match_results.drop()
         
-        # Reset session state lists
+        # Reset session state lists (will be reloaded on next dashboard entry)
         if 'admin_jd_list' in st.session_state: st.session_state.admin_jd_list = []
         if 'resumes_to_analyze' in st.session_state: st.session_state.resumes_to_analyze = []
         if 'admin_match_results' in st.session_state: st.session_state.admin_match_results = []
@@ -595,7 +619,7 @@ def admin_dashboard():
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
     
     # NEW: Check DB connection status
-    if not st.session_state.db.is_connected():
+    if 'db' not in st.session_state or not st.session_state.db.is_connected():
         st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
         return 
     
@@ -921,7 +945,7 @@ def candidate_dashboard():
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
     
     # NEW: Check DB connection status
-    if not st.session_state.db.is_connected():
+    if 'db' not in st.session_state or not st.session_state.db.is_connected():
         st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
         return 
         
@@ -971,7 +995,15 @@ def candidate_dashboard():
          st.header("Resume Parsing")
          if not st.session_state.full_text:
              st.warning("Please upload and parse a resume in the sidebar first.")
-             return
+             # Early exit is fine here as it's the first tab
+             # return
+
+         parsed = st.session_state.parsed
+         full_text = st.session_state.full_text
+
+         if "error" in parsed:
+             st.error(parsed.get("error", "An unknown error occurred during parsing."))
+             # return
 
          col1, col2 = st.columns(2)
          with col1:
@@ -979,39 +1011,34 @@ def candidate_dashboard():
          with col2:
              section = st.selectbox('Select Section to View', section_options, key='section_select_c')
 
-         parsed = st.session_state.parsed
-         full_text = st.session_state.full_text
 
-         if "error" in parsed:
-             st.error(parsed.get("error", "An unknown error occurred during parsing."))
-             return
+         if st.session_state.full_text:
+             if output_format == 'json':
+                 output_str = json.dumps(parsed, indent=2)
+                 st.text_area("Parsed Output (JSON)", output_str, height=350)
+             else:
+                 output_str = parse_with_llm(full_text, return_type='markdown')
+                 st.markdown("### Parsed Output (Markdown)")
+                 st.markdown(output_str)
+     
+             if st.session_state.excel_data:
+                 st.download_button(
+                     label="Download Parsed Data (Excel)",
+                     data=st.session_state.excel_data,
+                     file_name=f"{parsed.get('name', 'candidate').replace(' ', '_')}_parsed_data.xlsx",
+                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                 )
+             
+             section_content_str = ""
+             if section == "full resume":
+                 section_content_str = full_text
+             elif section in parsed:
+                 section_val = parsed[section]
+                 section_content_str = json.dumps(section_val, indent=2) if isinstance(section_val, (list, dict)) else str(section_val)
+             else:
+                 section_content_str = f"Section '{section}' not found or is empty."
 
-         if output_format == 'json':
-             output_str = json.dumps(parsed, indent=2)
-             st.text_area("Parsed Output (JSON)", output_str, height=350)
-         else:
-             output_str = parse_with_llm(full_text, return_type='markdown')
-             st.markdown("### Parsed Output (Markdown)")
-             st.markdown(output_str)
-
-         if st.session_state.excel_data:
-             st.download_button(
-                 label="Download Parsed Data (Excel)",
-                 data=st.session_state.excel_data,
-                 file_name=f"{parsed.get('name', 'candidate').replace(' ', '_')}_parsed_data.xlsx",
-                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-             )
-         
-         section_content_str = ""
-         if section == "full resume":
-             section_content_str = full_text
-         elif section in parsed:
-             section_val = parsed[section]
-             section_content_str = json.dumps(section_val, indent=2) if isinstance(section_val, (list, dict)) else str(section_val)
-         else:
-             section_content_str = f"Section '{section}' not found or is empty."
-
-         st.text_area("Selected Section Content", section_content_str, height=200)
+             st.text_area("Selected Section Content", section_content_str, height=200)
 
     # --- TAB 2: Resume Chatbot (Q&A) ---
     with tab2:
@@ -1019,43 +1046,45 @@ def candidate_dashboard():
          st.markdown("### Ask any question about the uploaded resume.")
          if not st.session_state.full_text:
              st.warning("Please upload and parse a resume first.")
-             return
+             # return
 
-         question = st.text_input("Your Question", placeholder="e.g., What are the candidate's key skills?")
-        
-         if st.button("Get Answer", key="qa_btn"):
-             with st.spinner("Generating answer..."):
-                 try:
-                     answer = qa_on_resume(question)
-                     st.session_state.qa_answer = answer
-                 except Exception as e:
-                     st.error(f"Error during Q&A: {e}")
-                     st.session_state.qa_answer = "Could not generate an answer."
+         if st.session_state.full_text:
+             question = st.text_input("Your Question", placeholder="e.g., What are the candidate's key skills?")
+            
+             if st.button("Get Answer", key="qa_btn"):
+                 with st.spinner("Generating answer..."):
+                     try:
+                         answer = qa_on_resume(question)
+                         st.session_state.qa_answer = answer
+                     except Exception as e:
+                         st.error(f"Error during Q&A: {e}")
+                         st.session_state.qa_answer = "Could not generate an answer."
 
-         if st.session_state.get('qa_answer'):
-             st.text_area("Answer", st.session_state.qa_answer, height=150)
+             if st.session_state.get('qa_answer'):
+                 st.text_area("Answer", st.session_state.qa_answer, height=150)
              
     # --- TAB 3: Interview Prep ---
     with tab3:
          st.header("Interview Preparation Tools")
          if not st.session_state.parsed or "error" in st.session_state.parsed:
              st.warning("Please upload and successfully parse a resume first.")
-             return
+             # return
          
-         st.subheader("Generate Interview Questions")
-         section_choice = st.selectbox("Select Section", question_section_options, key='iq_section_c')
-        
-         if st.button("Generate Interview Questions", key='iq_btn_c'):
-             with st.spinner("Generating questions..."):
-                 try:
-                     raw_questions_response = generate_interview_questions(st.session_state.parsed, section_choice)
-                     st.session_state.iq_output = raw_questions_response
-                 except Exception as e:
-                     st.error(f"Error generating questions: {e}")
-                     st.session_state.iq_output = "Error generating questions."
+         if st.session_state.parsed and "error" not in st.session_state.parsed:
+             st.subheader("Generate Interview Questions")
+             section_choice = st.selectbox("Select Section", question_section_options, key='iq_section_c')
+            
+             if st.button("Generate Interview Questions", key='iq_btn_c'):
+                 with st.spinner("Generating questions..."):
+                     try:
+                         raw_questions_response = generate_interview_questions(st.session_state.parsed, section_choice)
+                         st.session_state.iq_output = raw_questions_response
+                     except Exception as e:
+                         st.error(f"Error generating questions: {e}")
+                         st.session_state.iq_output = "Error generating questions."
 
-         if st.session_state.get('iq_output'):
-             st.text_area("Generated Interview Questions (by difficulty level)", st.session_state.iq_output, height=400)
+             if st.session_state.get('iq_output'):
+                 st.text_area("Generated Interview Questions (by difficulty level)", st.session_state.iq_output, height=400)
              
     # --- TAB 4: JD Management ---
     with tab4:
@@ -1302,7 +1331,6 @@ def main():
     # This must run before any dashboard attempts to access st.session_state.db
     if 'db' not in st.session_state:
         st.session_state.db = DatabaseManager(MONGODB_URI)
-        # We don't stop here, the dashboards will check st.session_state.db.is_connected()
             
     # Initialize session state for AI features
     if 'parsed' not in st.session_state:
