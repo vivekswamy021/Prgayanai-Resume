@@ -10,7 +10,6 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
-from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
 from bson.objectobjectid import ObjectId
 from datetime import datetime
 
