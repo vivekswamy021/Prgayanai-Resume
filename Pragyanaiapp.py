@@ -11,6 +11,7 @@ import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
 from bson.objectid import ObjectId
+from datetime import datetime
 
 # -------------------------
 # CONFIGURATION & API SETUP
@@ -19,11 +20,9 @@ from bson.objectid import ObjectId
 # CRITICAL FIX: Using the currently supported Groq model.
 GROQ_MODEL = "llama-3.1-8b-instant"
 
-# Options for LLM functions (defined for use in Candidate Dashboard)
+# Options for LLM functions
 section_options = ["name", "email", "phone", "skills", "education", "experience", "certifications", "projects", "strength", "personal_details", "github", "linkedin", "full resume"]
 question_section_options = ["skills","experience", "certifications", "education", "projects"]
-answer_types = [("Point-wise", "points"), ("Detailed", "detailed"), ("Key Points", "key")]
-
 
 # Load environment variables from .env file
 load_dotenv()
@@ -39,56 +38,72 @@ if not GROQ_API_KEY:
     )
     st.stop()
 
+if not MONGODB_URI:
+    st.error(
+        "🚨 FATAL ERROR: MONGODB_URI environment variable not set. "
+        "The application requires a MongoDB connection. Please check your '.env' file."
+    )
+    st.stop()
+
 # Initialize Groq Client
 client = Groq(api_key=GROQ_API_KEY)
 
-
 # -------------------------
-# NEW: MongoDB Database Manager
+# MongoDB Database Manager
 # -------------------------
 
 class DatabaseManager:
     """Handles connection and CRUD operations for MongoDB."""
     def __init__(self, uri):
-        if not uri:
-            st.error("🚨 MongoDB URI is missing.")
-            self.client = None
-            return
-
+        self.client = None
+        self.db = None
+        
         # Use st.cache_resource for the connection client
         @st.cache_resource(ttl=3600)
         def init_connection(mongo_uri):
             try:
-                # The default database is automatically selected from the URI if provided
-                return MongoClient(mongo_uri)
+                # Add server selection timeout to prevent infinite hangs
+                client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+                # Attempt a quick command to verify connection
+                client.admin.command('ping') 
+                return client
             except Exception as e:
-                st.error(f"MongoDB Connection Error: {e}")
+                # Log the connection failure
+                print(f"MongoDB Connection Error: {e}")
+                st.error(f"MongoDB Connection Error: Failed to connect. Check MONGODB_URI and network access. Error: {e}")
                 return None
 
         self.client = init_connection(uri)
-        self.db = self.client.get_default_database() if self.client else None
+        if self.client:
+            # Get the default database name specified in the connection string
+            self.db = self.client.get_default_database()
         
     def is_connected(self):
         return self.client is not None and self.db is not None
         
     # --- JD Management ---
     def save_jd(self, jd_data, user_role):
+        if not self.is_connected(): return None
         collection = self.db[f'{user_role}_jds']
-        # Check if a JD with the same name already exists for the user role
-        existing_jd = collection.find_one({'name': jd_data['name']})
+        # Use name and content hash to check for duplicates, simpler check here
+        existing_jd = collection.find_one({'name': jd_data['name'], 'content': jd_data['content']})
+        
+        # Add timestamp for tracking
+        jd_data['updated_at'] = datetime.utcnow()
+        
         if existing_jd:
-            # Update existing JD
+            # Update existing JD (though usually not necessary for JDs)
             collection.update_one({'_id': existing_jd['_id']}, {'$set': jd_data})
             return existing_jd['_id']
         else:
-            # Insert new JD
+            jd_data['created_at'] = datetime.utcnow()
             result = collection.insert_one(jd_data)
             return result.inserted_id
 
     def get_jds(self, user_role):
         if not self.is_connected(): return []
         collection = self.db[f'{user_role}_jds']
-        jds = list(collection.find({}))
+        jds = list(collection.find({}).sort('created_at', -1))
         # Convert ObjectId to string for safe handling in Streamlit
         for jd in jds:
             jd['_id'] = str(jd['_id'])
@@ -98,20 +113,24 @@ class DatabaseManager:
     def save_resume(self, resume_data):
         if not self.is_connected(): return None
         collection = self.db['admin_resumes']
-        # Use a hash or a similar unique identifier for resumes if names are not unique.
-        # For simplicity, we assume name is unique for now.
-        existing_resume = collection.find_one({'name': resume_data['name']})
+        
+        resume_name = resume_data['name']
+        resume_data['updated_at'] = datetime.utcnow()
+
+        # Check for resume with the same name
+        existing_resume = collection.find_one({'name': resume_name})
         if existing_resume:
             collection.update_one({'_id': existing_resume['_id']}, {'$set': resume_data})
             return existing_resume['_id']
         else:
+            resume_data['created_at'] = datetime.utcnow()
             result = collection.insert_one(resume_data)
             return result.inserted_id
 
     def get_resumes(self):
         if not self.is_connected(): return []
         collection = self.db['admin_resumes']
-        resumes = list(collection.find({}))
+        resumes = list(collection.find({}).sort('created_at', -1))
         for resume in resumes:
             resume['_id'] = str(resume['_id'])
         return resumes
@@ -120,15 +139,20 @@ class DatabaseManager:
     def save_match_result(self, result_data, user_role):
         if not self.is_connected(): return None
         collection = self.db[f'{user_role}_match_results']
+        result_data['created_at'] = datetime.utcnow()
         result = collection.insert_one(result_data)
         return result.inserted_id
         
     def get_match_results(self, user_role):
         if not self.is_connected(): return []
         collection = self.db[f'{user_role}_match_results']
-        results = list(collection.find({}).sort([('_id', -1)]).limit(10)) # Get last 10
+        # Get the last 50 results (or fewer)
+        results = list(collection.find({}).sort('created_at', -1).limit(50)) 
         for result in results:
             result['_id'] = str(result['_id'])
+            # Format the datetime for display
+            if 'created_at' in result:
+                result['created_at_str'] = result['created_at'].strftime("%Y-%m-%d %H:%M")
         return results
 
     # --- Utility: Clear all data (for demo/admin) ---
@@ -141,7 +165,13 @@ class DatabaseManager:
         self.db.admin_resumes.drop()
         self.db.admin_match_results.drop()
         self.db.candidate_match_results.drop()
-        st.success("All application data cleared from MongoDB.")
+        
+        # Reset session state lists
+        if 'admin_jd_list' in st.session_state: st.session_state.admin_jd_list = []
+        if 'resumes_to_analyze' in st.session_state: st.session_state.resumes_to_analyze = []
+        if 'admin_match_results' in st.session_state: st.session_state.admin_match_results = []
+        if 'candidate_jd_list' in st.session_state: st.session_state.candidate_jd_list = []
+        if 'candidate_match_results' in st.session_state: st.session_state.candidate_match_results = []
 
 # -------------------------
 # Utility: Navigation Manager
@@ -153,16 +183,19 @@ def go_to(page_name):
 # -------------------------
 # CORE LOGIC: FILE HANDLING AND EXTRACTION
 # -------------------------
-# ... (extract_content, get_file_type, parse_with_llm, extract_jd_from_linkedin_url, evaluate_jd_fit, etc. functions remain the same) ...
-# (Keeping the rest of the file utility functions concise for brevity, assume they are present)
+
 def get_file_type(file_path):
+    """Identifies the file type based on its extension."""
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == '.pdf': return 'pdf'
-    elif ext == '.docx': return 'docx'
-    else: return 'txt' 
+    if ext == '.pdf':
+        return 'pdf'
+    elif ext == '.docx':
+        return 'docx'
+    else:
+        return 'txt' 
 
 def extract_content(file_type, file_path):
-    # ... (function body remains the same) ...
+    """Extracts text content from PDF or DOCX files using robust libraries."""
     try:
         if file_type == 'pdf':
             text = ''
@@ -194,7 +227,7 @@ def extract_content(file_type, file_path):
 
 @st.cache_data(show_spinner="Analyzing content with Groq LLM...")
 def parse_with_llm(text, return_type='json'):
-    # ... (function body remains the same) ...
+    """Sends resume text to the LLM for structured information extraction."""
     if text.startswith("Error"):
         return {"error": text, "raw_output": ""}
 
@@ -244,7 +277,6 @@ def parse_with_llm(text, return_type='json'):
 
     if return_type == 'json':
         return parsed
-    # ... (rest of the function remains the same) ...
     elif return_type == 'markdown':
         if "error" in parsed:
             return f"**Error:** {parsed.get('error', 'Unknown parsing error')}\nRaw output:\n```\n{parsed.get('raw_output','')}\n```"
@@ -261,15 +293,18 @@ def parse_with_llm(text, return_type='json'):
                     for sub_k, sub_v in v.items():
                         if sub_v:
                             md += f"  - {sub_k.replace('_', ' ').title()}: {sub_v}\n"
-                    
                 else:
                     md += f"  {v}\n"
                 md += "\n"
         return md
     return {"error": "Invalid return_type"}
 
+
 def extract_jd_from_linkedin_url(url: str) -> str:
-    # ... (function body remains the same) ...
+    """
+    Simulates JD content extraction from a LinkedIn URL.
+    This simulation is used for robustness in a pure Streamlit environment.
+    """
     try:
         job_title = "Data Scientist"
         try:
@@ -310,8 +345,9 @@ def extract_jd_from_linkedin_url(url: str) -> str:
     except Exception as e:
         return f"[Fatal Extraction Error: Simulation failed for URL {url}. Error: {e}]"
 
+
 def evaluate_jd_fit(job_description, parsed_json):
-    # ... (function body remains the same) ...
+    """Evaluates how well a resume fits a given job description, including section-wise scores."""
     if not job_description.strip(): return "Please paste a job description."
     
     relevant_resume_data = {
@@ -361,12 +397,12 @@ def evaluate_jd_fit(job_description, parsed_json):
     )
     return response.choices[0].message.content.strip()
 
+
 # -------------------------
 # Utility Functions
 # -------------------------
-
 def dump_to_excel(parsed_json, filename):
-    # ... (function body remains the same) ...
+    """Dumps parsed JSON data to an Excel file."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Profile Data"
@@ -398,7 +434,7 @@ def dump_to_excel(parsed_json, filename):
         return f.read()
 
 def parse_and_store_resume(uploaded_file, file_name_key='default'):
-    # ... (function body remains the same) ...
+    """Handles file upload, parsing, and stores results in session state and DB."""
     
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, uploaded_file.name)
@@ -416,7 +452,7 @@ def parse_and_store_resume(uploaded_file, file_name_key='default'):
     if not parsed or "error" in parsed:
         return {"error": parsed.get('error', 'Unknown parsing error'), "full_text": text}
 
-    # Generate Excel data for download if needed (only for single resume upload in Candidate dashboard)
+    # Generate Excel data for download
     excel_data = None
     if file_name_key == 'single_resume_candidate':
         try:
@@ -429,7 +465,7 @@ def parse_and_store_resume(uploaded_file, file_name_key='default'):
             st.warning(f"Could not generate Excel file for single resume: {e}")
     
     # NEW: Store resume data in MongoDB if it's an Admin upload
-    if file_name_key == 'admin_analysis':
+    if file_name_key == 'admin_analysis' and st.session_state.db.is_connected():
         resume_data_to_store = {
             "name": parsed.get('name', uploaded_file.name.split('.')[0]),
             "parsed": parsed,
@@ -446,7 +482,7 @@ def parse_and_store_resume(uploaded_file, file_name_key='default'):
 
 
 def qa_on_resume(question):
-    # ... (function body remains the same) ...
+    """Chatbot for Resume (Q&A) using LLM."""
     parsed_json = st.session_state.parsed
     full_text = st.session_state.full_text
     prompt = f"""Given the following resume information:
@@ -460,7 +496,7 @@ def qa_on_resume(question):
     return response.choices[0].message.content.strip()
 
 def generate_interview_questions(parsed_json, section):
-    # ... (function body remains the same) ...
+    """Generates categorized interview questions using LLM."""
     section_title = section.replace("_", " ").title()
     section_content = parsed_json.get(section, "")
     if isinstance(section_content, (list, dict)):
@@ -489,31 +525,94 @@ Q1: Question text...
 
 
 # -------------------------
-# UI PAGES: Dashboards (UPDATED to use MongoDB)
+# UI PAGES: Authentication
+# -------------------------
+def login_page():
+    st.title("🌐 PragyanAI Job Portal")
+    st.header("Login")
+
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login", use_container_width=True):
+        if email and password:
+            st.success("Login successful!")
+            go_to("role_selection")
+        else:
+            st.error("Please enter both email and password")
+
+    st.markdown("---")
+    
+    if st.button("Don't have an account? Sign up here"):
+        go_to("signup")
+
+def signup_page():
+    st.header("Create an Account")
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+    confirm = st.text_input("Confirm Password", type="password")
+
+    if st.button("Sign Up", use_container_width=True):
+        if password == confirm and email:
+            st.success("Signup successful! Please login.")
+            go_to("login")
+        else:
+            st.error("Passwords do not match or email is empty")
+
+    if st.button("Already have an account? Login here"):
+        go_to("login")
+
+def role_selection_page():
+    st.header("Select Your Role")
+    role = st.selectbox(
+        "Choose a Dashboard",
+        ["Select Role", "Admin Dashboard", "Candidate Dashboard", "Hiring Company Dashboard"]
+    )
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        if st.button("Continue", use_container_width=True):
+            if role == "Admin Dashboard":
+                go_to("admin_dashboard")
+            elif role == "Candidate Dashboard":
+                go_to("candidate_dashboard")
+            elif role == "Hiring Company Dashboard":
+                go_to("hiring_dashboard")
+            else:
+                st.warning("Please select a role first")
+
+    with col2:
+        if st.button("⬅️ Go Back to Login"):
+            go_to("login")
+
+# -------------------------
+# UI PAGES: Dashboards
 # -------------------------
 
 def admin_dashboard():
     st.header("🧑‍💼 Admin Dashboard")
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
     
-    # Initialize Admin session state variables
+    # NEW: Check DB connection status
+    if not st.session_state.db.is_connected():
+        st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
+        return 
+    
+    # Initialize Admin session state variables and load from DB
     if "admin_jd_list" not in st.session_state:
-        # NEW: Load from DB on first run/re-init
         st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
     if "resumes_to_analyze" not in st.session_state:
-        # NEW: Load from DB on first run/re-init
         st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
     if "admin_match_results" not in st.session_state:
-        # NEW: Load recent results from DB
         st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
-        
-    tab_jd, tab_analysis, tab_settings = st.tabs(["📄 Job Description Management", "📊 Resume Analysis", "⚙️ Settings"]) # Added Settings tab
+    
+    tab_jd, tab_analysis, tab_settings = st.tabs(["📄 Job Description Management", "📊 Resume Analysis", "⚙️ Settings"])
 
     # --- TAB 1: JD Management ---
     with tab_jd:
         st.subheader("Add and Manage Job Descriptions (JD)")
         
-        # ... (JD addition logic remains largely the same, but now saves to DB) ...
         jd_type = st.radio("Select JD Type", ["Single JD", "Multiple JD"], key="jd_type_admin")
         st.markdown("### Add JD by:")
         
@@ -537,12 +636,12 @@ def admin_dashboard():
                         
                         name_base = url.split('/jobs/view/')[-1].split('/')[0] if '/jobs/view/' in url else f"URL {count+1}"
                         if not jd_text.startswith("[Error"):
-                            # NEW: Save to DB
+                            # Save to DB
                             jd_data = {"name": f"JD from URL: {name_base}", "content": jd_text, "source": "url"}
                             st.session_state.db.save_jd(jd_data, 'admin')
                             count += 1
                             
-                    # NEW: Refresh list from DB
+                    # Refresh list from DB
                     st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
                     if count > 0:
                         st.success(f"✅ {count} JD(s) added successfully!")
@@ -564,11 +663,11 @@ def admin_dashboard():
                             if len(name_base) > 30: name_base = f"{name_base[:27]}..."
                             if not name_base: name_base = f"Pasted JD {len(st.session_state.admin_jd_list) + i + 1}"
                             
-                            # NEW: Save to DB
+                            # Save to DB
                             jd_data = {"name": name_base, "content": text, "source": "pasted"}
                             st.session_state.db.save_jd(jd_data, 'admin')
                             
-                    # NEW: Refresh list from DB
+                    # Refresh list from DB
                     st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
                     st.success(f"✅ {len(texts)} JD(s) added successfully!")
 
@@ -594,12 +693,12 @@ def admin_dashboard():
                         jd_text = extract_content(file_type, temp_path)
                         
                         if not jd_text.startswith("Error"):
-                            # NEW: Save to DB
+                            # Save to DB
                             jd_data = {"name": file.name, "content": jd_text, "source": "file"}
                             st.session_state.db.save_jd(jd_data, 'admin')
                             count += 1
                             
-                # NEW: Refresh list from DB
+                # Refresh list from DB
                 st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
                 if count > 0:
                     st.success(f"✅ {count} JD(s) added successfully!")
@@ -614,12 +713,12 @@ def admin_dashboard():
                 display_title = title.replace("--- Simulated JD for: ", "")
                 col_disp, col_del = st.columns([10, 1])
                 with col_disp:
-                    with st.expander(f"JD {idx}: {display_title}"):
+                    with st.expander(f"JD {idx}: {display_title} (Added: {jd_item.get('created_at', 'N/A').strftime('%Y-%m-%d')})"):
                         st.text(jd_item['content'])
                 with col_del:
-                    # Added a delete button for management
                     if st.button("🗑️", key=f"del_jd_admin_{jd_item['_id']}"):
                         st.session_state.db.db.admin_jds.delete_one({'_id': ObjectId(jd_item['_id'])})
+                        # Refresh list immediately after deletion
                         st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
                         st.rerun()
         else:
@@ -648,7 +747,7 @@ def admin_dashboard():
                 with st.spinner("Parsing resume(s)... This may take a moment."):
                     for file in files_to_process:
                         if file:
-                            # parse_and_store_resume now saves to DB
+                            # parse_and_store_resume saves to DB if file_name_key='admin_analysis'
                             result = parse_and_store_resume(file, file_name_key='admin_analysis')
                             
                             if "error" not in result:
@@ -656,7 +755,7 @@ def admin_dashboard():
                             else:
                                 st.error(f"Failed to parse {file.name}: {result['error']}")
 
-                # NEW: Refresh list from DB
+                # Refresh list from DB
                 st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
                 if count > 0:
                     st.success(f"Successfully loaded and parsed {count} resume(s) for analysis and saved to DB.")
@@ -664,11 +763,11 @@ def admin_dashboard():
                     st.warning("No new resumes were successfully loaded and parsed.")
             else:
                 st.warning("Please upload one or more resume files.")
-        
-        st.markdown("#### Resumes Available for Analysis:")
+
+        st.markdown("#### Resumes Available for Analysis (Loaded from DB):")
         if st.session_state.resumes_to_analyze:
              for resume_data in st.session_state.resumes_to_analyze:
-                 st.write(f"- {resume_data['name']}")
+                 st.write(f"- **{resume_data['name']}** (ID: {resume_data['_id'][:6]}...)")
         else:
              st.info("No resumes available.")
         
@@ -691,7 +790,6 @@ def admin_dashboard():
 
 
         if st.button("Run Match Analysis", key="run_match_analysis_admin"):
-            st.session_state.admin_match_results = []
             
             if not selected_jd_content:
                 st.error("Selected JD content is empty.")
@@ -707,6 +805,7 @@ def admin_dashboard():
                         fit_output = evaluate_jd_fit(selected_jd_content, parsed_json)
                         
                         # --- ENHANCED EXTRACTION LOGIC (FIXED) ---
+                        # Robust Regexes to handle single-line LLM output
                         overall_score_match = re.search(r'Overall Fit Score:\s*(\d+)\s*/10', fit_output, re.IGNORECASE)
                         section_analysis_match = re.search(
                              r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', 
@@ -739,9 +838,8 @@ def admin_dashboard():
                             "education_percent": education_percent,   
                             "full_analysis": fit_output
                         }
-                        # NEW: Save results to DB
+                        # Save results to DB
                         st.session_state.db.save_match_result(result_item, 'admin')
-                        st.session_state.admin_match_results.append(result_item)
                         
                     except Exception as e:
                         error_item = {
@@ -753,38 +851,41 @@ def admin_dashboard():
                             "education_percent": "Error",   
                             "full_analysis": f"Error running analysis: {e}\n{traceback.format_exc()}"
                         }
-                        st.session_state.admin_match_results.append(error_item)
+                        st.session_state.db.save_match_result(error_item, 'admin')
                         
-                # NEW: Refresh match results from DB
+                # Refresh match results from DB
                 st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
                 st.success("Analysis complete and results saved to DB!")
 
 
         # 3. Display Results
         if st.session_state.get('admin_match_results'):
-            st.markdown("#### 3. Recent Match Results (From DB)")
-            # Filter to show only results for the currently selected JD (if any) for a cleaner view
-            current_results = [r for r in st.session_state.admin_match_results if r['jd_name'] == selected_jd_name]
+            st.markdown("#### 3. Recent Match Results (Loaded from DB)")
             
-            results_df = current_results if current_results else st.session_state.admin_match_results
-            
-            # Create a simple table/summary of results
+            # Filter by selected JD for better focus
+            results_to_display = [r for r in st.session_state.admin_match_results if r['jd_name'] == selected_jd_name]
+            # If no results match the current JD, show all recent results
+            if not results_to_display:
+                results_to_display = st.session_state.admin_match_results
+                st.info(f"Showing all {len(results_to_display)} most recent results as none match the selected JD: {selected_jd_name}")
+
             display_data = []
-            for item in results_df:
+            for item in results_to_display:
                 display_data.append({
                     "Resume": item["resume_name"],
                     "JD": item["jd_name"],
                     "Fit Score (out of 10)": item["overall_score"],
                     "Skills (%)": item.get("skills_percent", "N/A"),
                     "Experience (%)": item.get("experience_percent", "N/A"), 
-                    "Education (%)": item.get("education_percent", "N/A"),   
+                    "Education (%)": item.get("education_percent", "N/A"),
+                    "Time": item.get('created_at_str', 'N/A')
                 })
 
             st.dataframe(display_data, use_container_width=True)
 
             # Display detailed analysis in expanders
             st.markdown("##### Detailed Reports")
-            for item in results_df:
+            for item in results_to_display:
                 header_text = f"Report for **{item['resume_name']}** against {item['jd_name']} (Score: **{item['overall_score']}/10** | S: **{item.get('skills_percent', 'N/A')}%** | E: **{item.get('experience_percent', 'N/A')}%** | Edu: **{item.get('education_percent', 'N/A')}%**)"
                 with st.expander(header_text):
                     st.markdown(item['full_analysis'])
@@ -794,14 +895,20 @@ def admin_dashboard():
         st.subheader("Database Settings")
         st.warning("Use these options with caution, as they affect persistent data.")
         
+        if st.button("🔄 Reload All Data from MongoDB", key="reload_db_admin"):
+            st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
+            st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+            st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
+            st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
+            st.session_state.candidate_match_results = st.session_state.db.get_match_results('candidate')
+            st.success("All data reloaded from MongoDB.")
+            st.rerun()
+
+        st.markdown("---")
         if st.button("🚨 Clear ALL Application Data from MongoDB 🚨", key="clear_db_admin"):
             if st.session_state.db and st.session_state.db.is_connected():
                 st.session_state.db.clear_all_data()
-                st.session_state.admin_jd_list = []
-                st.session_state.resumes_to_analyze = []
-                st.session_state.admin_match_results = []
-                st.session_state.candidate_jd_list = []
-                st.session_state.candidate_match_results = []
+                st.success("All application data cleared from MongoDB and session state reset.")
                 st.rerun()
             else:
                 st.error("Database is not connected.")
@@ -813,7 +920,12 @@ def candidate_dashboard():
 
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
     
-    # NEW: Initialize candidate JD and results lists from DB
+    # NEW: Check DB connection status
+    if not st.session_state.db.is_connected():
+        st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
+        return 
+        
+    # Initialize candidate JD and results lists from DB
     if "candidate_jd_list" not in st.session_state:
         st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
     if "candidate_match_results" not in st.session_state:
@@ -821,8 +933,6 @@ def candidate_dashboard():
 
     # Sidebar for Resume Upload (Centralized Upload)
     with st.sidebar:
-        # ... (Resume upload logic remains the same, as the resume itself isn't saved to DB for the candidate, 
-        # only the JDs and match results are persistent)
         st.header("Upload Your Resume")
         uploaded_file = st.file_uploader("Choose a PDF or DOCX file", type=["pdf", "docx"])
         
@@ -856,13 +966,13 @@ def candidate_dashboard():
         "🎯 Batch JD Match"  
     ])
     
-    # ... (Tab 1, Tab 2, Tab 3 content remains largely the same) ...
+    # --- TAB 1: Resume Parsing ---
     with tab1:
          st.header("Resume Parsing")
          if not st.session_state.full_text:
              st.warning("Please upload and parse a resume in the sidebar first.")
              return
-         # ... (rest of Tab 1) ...
+
          col1, col2 = st.columns(2)
          with col1:
              output_format = st.radio('Output Format', ['json', 'markdown'], key='format_radio_c')
@@ -903,13 +1013,14 @@ def candidate_dashboard():
 
          st.text_area("Selected Section Content", section_content_str, height=200)
 
+    # --- TAB 2: Resume Chatbot (Q&A) ---
     with tab2:
          st.header("Resume Chatbot (Q&A)")
          st.markdown("### Ask any question about the uploaded resume.")
          if not st.session_state.full_text:
              st.warning("Please upload and parse a resume first.")
              return
-         # ... (rest of Tab 2) ...
+
          question = st.text_input("Your Question", placeholder="e.g., What are the candidate's key skills?")
         
          if st.button("Get Answer", key="qa_btn"):
@@ -924,12 +1035,13 @@ def candidate_dashboard():
          if st.session_state.get('qa_answer'):
              st.text_area("Answer", st.session_state.qa_answer, height=150)
              
+    # --- TAB 3: Interview Prep ---
     with tab3:
          st.header("Interview Preparation Tools")
          if not st.session_state.parsed or "error" in st.session_state.parsed:
              st.warning("Please upload and successfully parse a resume first.")
              return
-         # ... (rest of Tab 3) ...
+         
          st.subheader("Generate Interview Questions")
          section_choice = st.selectbox("Select Section", question_section_options, key='iq_section_c')
         
@@ -945,7 +1057,7 @@ def candidate_dashboard():
          if st.session_state.get('iq_output'):
              st.text_area("Generated Interview Questions (by difficulty level)", st.session_state.iq_output, height=400)
              
-    # --- TAB 4: JD Management (UPDATED to use MongoDB) ---
+    # --- TAB 4: JD Management ---
     with tab4:
         st.header("📚 Manage Job Descriptions for Matching")
         st.markdown("JDs added here are saved for your batch matching.")
@@ -973,12 +1085,12 @@ def candidate_dashboard():
                         
                         name_base = url.split('/jobs/view/')[-1].split('/')[0] if '/jobs/view/' in url else f"URL {count+1}"
                         if not jd_text.startswith("[Error"):
-                            # NEW: Save to DB
+                            # Save to DB
                             jd_data = {"name": f"JD from URL: {name_base}", "content": jd_text, "source": "url"}
                             st.session_state.db.save_jd(jd_data, 'candidate')
                             count += 1
                             
-                    # NEW: Refresh list from DB
+                    # Refresh list from DB
                     st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
                     if count > 0:
                         st.success(f"✅ {count} JD(s) added successfully!")
@@ -1000,11 +1112,11 @@ def candidate_dashboard():
                             if len(name_base) > 30: name_base = f"{name_base[:27]}..."
                             if not name_base: name_base = f"Pasted JD {len(st.session_state.candidate_jd_list) + i + 1}"
                             
-                            # NEW: Save to DB
+                            # Save to DB
                             jd_data = {"name": name_base, "content": text, "source": "pasted"}
                             st.session_state.db.save_jd(jd_data, 'candidate')
 
-                    # NEW: Refresh list from DB
+                    # Refresh list from DB
                     st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
                     st.success(f"✅ {len(texts)} JD(s) added successfully!")
 
@@ -1030,12 +1142,12 @@ def candidate_dashboard():
                         jd_text = extract_content(file_type, temp_path)
                         
                         if not jd_text.startswith("Error"):
-                            # NEW: Save to DB
+                            # Save to DB
                             jd_data = {"name": file.name, "content": jd_text, "source": "file"}
                             st.session_state.db.save_jd(jd_data, 'candidate')
                             count += 1
 
-                # NEW: Refresh list from DB
+                # Refresh list from DB
                 st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
                 if count > 0:
                     st.success(f"✅ {count} JD(s) added successfully!")
@@ -1050,10 +1162,9 @@ def candidate_dashboard():
                 display_title = title.replace("--- Simulated JD for: ", "")
                 col_disp, col_del = st.columns([10, 1])
                 with col_disp:
-                    with st.expander(f"JD {idx}: {display_title}"):
+                    with st.expander(f"JD {idx}: {display_title} (Added: {jd_item.get('created_at', 'N/A').strftime('%Y-%m-%d')})"):
                         st.text(jd_item['content'])
                 with col_del:
-                    # Added a delete button for management
                     if st.button("🗑️", key=f"del_jd_candidate_{jd_item['_id']}"):
                         st.session_state.db.db.candidate_jds.delete_one({'_id': ObjectId(jd_item['_id'])})
                         st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
@@ -1062,7 +1173,7 @@ def candidate_dashboard():
             st.info("No Job Descriptions added yet.")
 
 
-    # --- TAB 5: Batch JD Match (UPDATED to use MongoDB) ---
+    # --- TAB 5: Batch JD Match ---
     with tab5:
         st.header("🎯 Batch JD Match (Results saved to DB)")
         st.markdown("Compare your current resume against all saved job descriptions.")
@@ -1079,7 +1190,6 @@ def candidate_dashboard():
             
             resume_name = st.session_state.parsed.get('name', 'Uploaded Resume')
             parsed_json = st.session_state.parsed
-            new_results = []
 
             with st.spinner(f"Matching {resume_name}'s resume against {len(st.session_state.candidate_jd_list)} JDs..."):
                 for jd_item in st.session_state.candidate_jd_list:
@@ -1091,6 +1201,7 @@ def candidate_dashboard():
                         fit_output = evaluate_jd_fit(jd_content, parsed_json)
                         
                         # --- ENHANCED EXTRACTION LOGIC (FIXED) ---
+                        # Robust Regexes to handle single-line LLM output
                         overall_score_match = re.search(r'Overall Fit Score:\s*(\d+)\s*/10', fit_output, re.IGNORECASE)
                         section_analysis_match = re.search(
                              r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', 
@@ -1122,13 +1233,11 @@ def candidate_dashboard():
                             "experience_percent": experience_percent, 
                             "education_percent": education_percent,   
                             "full_analysis": fit_output,
-                            "resume_name": resume_name, # Added for context in DB
-                            "parsed_resume_snapshot": parsed_json # Added for full persistence
+                            "resume_name": resume_name, 
                         }
                         
-                        # NEW: Save results to DB
+                        # Save results to DB
                         st.session_state.db.save_match_result(result_item, 'candidate')
-                        new_results.append(result_item)
                         
                     except Exception as e:
                         error_item = {
@@ -1140,16 +1249,16 @@ def candidate_dashboard():
                             "full_analysis": f"Error running analysis for {jd_name}: {e}\n{traceback.format_exc()}",
                             "resume_name": resume_name
                         }
-                        new_results.append(error_item)
+                        st.session_state.db.save_match_result(error_item, 'candidate')
                 
-                # NEW: Refresh match results from DB
+                # Refresh match results from DB
                 st.session_state.candidate_match_results = st.session_state.db.get_match_results('candidate')
                 st.success("Batch analysis complete and results saved to DB!")
 
 
         # 3. Display Results
         if st.session_state.get('candidate_match_results'):
-            st.markdown("#### Recent Match Results for Your Resume (From DB)")
+            st.markdown("#### Recent Match Results for Your Resume (Loaded from DB)")
             results_df = st.session_state.candidate_match_results
             
             # Create a simple table/summary of results
@@ -1161,7 +1270,7 @@ def candidate_dashboard():
                     "Skills (%)": item.get("skills_percent", "N/A"),
                     "Experience (%)": item.get("experience_percent", "N/A"), 
                     "Education (%)": item.get("education_percent", "N/A"),   
-                    "Date": item.get('_id') # Use ObjectId as a pseudo-date/time for demonstration
+                    "Time": item.get('created_at_str', 'N/A')
                 })
 
             st.dataframe(display_data, use_container_width=True)
@@ -1169,12 +1278,11 @@ def candidate_dashboard():
             # Display detailed analysis in expanders
             st.markdown("##### Detailed Reports")
             for item in results_df:
-                header_text = f"Report for **{item['jd_name'].replace('--- Simulated JD for: ', '')}** (Score: **{item['overall_score']}/10** | S: **{item.get('skills_percent', 'N/A')}%** | E: **{item.get('experience_percent', 'N/A')}%** | Edu: **{item.get('education_percent', 'N/A')}%**)"
+                header_text = f"Report for **{item['jd_name'].replace('--- Simulated JD for: ', '')}** (Score: **{item['overall_score']}/10** | S: **{item.get('skills_percent', 'N/A')}%** | E: **{item.get('experience_percent', 'N/A')}%** | Edu: **{item.get('education_percent', 'N/A')}%**) @ {item.get('created_at_str', 'N/A')}"
                 with st.expander(header_text):
                     st.markdown(item['full_analysis'])
 
 
-# ... (hiring_dashboard remains the same) ...
 def hiring_dashboard():
     st.header("🏢 Hiring Company Dashboard")
     st.write("Manage job postings and view candidate applications. (Placeholder for future features)")
@@ -1191,11 +1299,10 @@ def main():
         st.session_state.page = "login"
         
     # NEW: Initialize Database Connection
+    # This must run before any dashboard attempts to access st.session_state.db
     if 'db' not in st.session_state:
         st.session_state.db = DatabaseManager(MONGODB_URI)
-        if not st.session_state.db.is_connected():
-            st.error("Cannot connect to MongoDB. Please check your MONGODB_URI in the .env file.")
-            st.stop()
+        # We don't stop here, the dashboards will check st.session_state.db.is_connected()
             
     # Initialize session state for AI features
     if 'parsed' not in st.session_state:
@@ -1206,7 +1313,7 @@ def main():
         st.session_state.iq_output = ""
         st.session_state.jd_fit_output = ""
         
-        # Lists will be loaded from DB in respective dashboards now
+        # Reset lists if a hard restart occurs, lists will be loaded from DB in respective dashboards
         st.session_state.admin_jd_list = []
         st.session_state.resumes_to_analyze = []
         st.session_state.admin_match_results = []
@@ -1229,64 +1336,4 @@ def main():
         hiring_dashboard()
 
 if __name__ == '__main__':
-    # Add boilerplate pages for completeness (login, signup, role_selection)
-    def login_page():
-        st.title("🌐 PragyanAI Job Portal")
-        st.header("Login")
-
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
-
-        if st.button("Login", use_container_width=True):
-            if email and password:
-                st.success("Login successful!")
-                go_to("role_selection")
-            else:
-                st.error("Please enter both email and password")
-
-        st.markdown("---")
-        
-        if st.button("Don't have an account? Sign up here"):
-            go_to("signup")
-
-    def signup_page():
-        st.header("Create an Account")
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
-        confirm = st.text_input("Confirm Password", type="password")
-
-        if st.button("Sign Up", use_container_width=True):
-            if password == confirm and email:
-                st.success("Signup successful! Please login.")
-                go_to("login")
-            else:
-                st.error("Passwords do not match or email is empty")
-
-        if st.button("Already have an account? Login here"):
-            go_to("login")
-
-    def role_selection_page():
-        st.header("Select Your Role")
-        role = st.selectbox(
-            "Choose a Dashboard",
-            ["Select Role", "Admin Dashboard", "Candidate Dashboard", "Hiring Company Dashboard"]
-        )
-
-        col1, col2 = st.columns([2, 1])
-
-        with col1:
-            if st.button("Continue", use_container_width=True):
-                if role == "Admin Dashboard":
-                    go_to("admin_dashboard")
-                elif role == "Candidate Dashboard":
-                    go_to("candidate_dashboard")
-                elif role == "Hiring Company Dashboard":
-                    go_to("hiring_dashboard")
-                else:
-                    st.warning("Please select a role first")
-
-        with col2:
-            if st.button("⬅️ Go Back to Login"):
-                go_to("login")
-    
     main()
