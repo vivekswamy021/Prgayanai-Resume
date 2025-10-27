@@ -10,6 +10,7 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
 from bson.objectid import ObjectId
 from datetime import datetime
 
@@ -223,7 +224,7 @@ class DatabaseManager:
                 result['created_at_str'] = result['created_at'].strftime("%Y-%m-%d %H:%M")
         return results
 
-    # --- NEW: Platform Metrics ---
+    # --- Platform Metrics ---
     def get_platform_metrics(self):
         """Calculates key counts for the platform."""
         if not self.is_connected():
@@ -232,7 +233,7 @@ class DatabaseManager:
                 "total_jds": 0,
                 "total_vendors": 0,
                 "no_of_applications": 0,
-                "no_of_social_media_posts": 0 # Placeholder for future feature
+                "no_of_social_media_posts": 0 
             }
 
         # Count unique candidates (resumes)
@@ -247,8 +248,10 @@ class DatabaseManager:
         # Count total match results (applications/analyses run)
         no_of_applications = self.db['admin_match_results'].count_documents({}) + self.db['candidate_match_results'].count_documents({})
 
-        # Social Media Posts (Placeholder for future feature)
-        no_of_social_media_posts = 0 # Assuming 0 for now as the feature is not implemented
+        # Fetch Social Media Posts counter from a dedicated metrics collection
+        metrics_collection = self.db['platform_metrics']
+        metrics_doc = metrics_collection.find_one({'_id': 'social_media_counter'})
+        no_of_social_media_posts = metrics_doc.get('count', 0) if metrics_doc else 0
 
         return {
             "total_candidates": total_candidates,
@@ -257,7 +260,71 @@ class DatabaseManager:
             "no_of_applications": no_of_applications,
             "no_of_social_media_posts": no_of_social_media_posts
         }
+    
+    # --- NEW: Update Social Media Counter ---
+    def update_social_media_posts_count(self, change_by):
+        """Updates the social media posts counter in the dedicated metrics document."""
+        if not self.is_connected(): return 0
+        
+        metrics_collection = self.db['platform_metrics']
+        
+        # Use find_one_and_update with upsert=True to create the document if it doesn't exist
+        # and atomically update the count.
+        result = metrics_collection.find_one_and_update(
+            {'_id': 'social_media_counter'},
+            {
+                '$inc': {'count': change_by}, # Increment or decrement the 'count' field
+                '$set': {'updated_at': datetime.utcnow()}
+            },
+            upsert=True,
+            return_document='after' # Return the updated document
+        )
+        
+        # Handle case where the counter might go below zero (optional, but good practice)
+        if result and result['count'] < 0:
+            # Set it back to 0 if it dipped negative
+            metrics_collection.update_one(
+                {'_id': 'social_media_counter'},
+                {'$set': {'count': 0}}
+            )
+            return 0
+            
+        return result.get('count', 0) if result else 0
 
+    # --- NEW: Get Latest Applications/Matches ---
+    def get_latest_applications(self, limit=10):
+        """Fetches the latest match results from both admin and candidate collections."""
+        if not self.is_connected(): return []
+        
+        # Aggregate results from both collections
+        pipeline = [
+            # UnionWith is the MongoDB 4.4+ way to combine collections
+            {
+                '$unionWith': {
+                    'coll': 'candidate_match_results',
+                    'pipeline': [
+                        {'$addFields': {'Source': 'Candidate'}}, # Tag the source
+                    ]
+                }
+            },
+            {'$addFields': {'Source': {'$ifNull': ['$Source', 'Admin']}}}, # Tag the original collection (Admin)
+            {'$sort': {'created_at': -1}}, # Sort by newest first
+            {'$limit': limit}, # Limit the results
+            {'$project': { # Select and format fields
+                '_id': {'$toString': '$_id'},
+                'resume_name': 1,
+                'jd_name': 1,
+                'overall_score': 1,
+                'Source': 1,
+                'created_at': {'$dateToString': {'format': "%Y-%m-%d %H:%M", 'date': "$created_at"}}
+            }}
+        ]
+
+        # Use the aggregation framework on one of the collections
+        # Since we use $unionWith, it doesn't matter which one we start with.
+        results = list(self.db['admin_match_results'].aggregate(pipeline))
+        
+        return results
 
     # --- Utility: Clear all data (for demo/admin) ---
     def clear_all_data(self):
@@ -269,7 +336,8 @@ class DatabaseManager:
         self.db.admin_resumes.drop()
         self.db.admin_match_results.drop()
         self.db.candidate_match_results.drop()
-        self.db.vendors.drop() # <-- NEW: Drop vendors collection
+        self.db.vendors.drop() 
+        self.db.platform_metrics.drop() # <-- Drop platform metrics collection
         
         # Reset session state lists (will be reloaded on next dashboard entry)
         if 'admin_jd_list' in st.session_state: st.session_state.admin_jd_list = []
@@ -701,17 +769,14 @@ def admin_dashboard():
     st.header("🧑‍💼 Admin Dashboard")
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
     
-    # NEW: Check DB connection status
+    # Check DB connection status
     if 'db' not in st.session_state or not st.session_state.db.is_connected():
         st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
         
-        # FIX: Initialize lists to empty if DB is not connected to prevent AttributeErrors later
         st.session_state.admin_jd_list = []
         st.session_state.resumes_to_analyze = []
         st.session_state.vendor_list = []
         st.session_state.admin_match_results = []
-        # Return here to prevent running database code below
-        # We rely on the rest of the UI to handle empty lists gracefully.
     
     # Initialize Admin session state variables and load from DB
     if st.session_state.db.is_connected():
@@ -719,16 +784,18 @@ def admin_dashboard():
             st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
         
         # Resumes must be reloaded to get the latest status
-        st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+        # This will be re-fetched in tab_candidate_approval explicitly for immediate feedback.
+        if "resumes_to_analyze" not in st.session_state:
+            st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
         
-        # NEW: Initialize Vendor list
+        # Initialize Vendor list
         if "vendor_list" not in st.session_state:
             st.session_state.vendor_list = st.session_state.db.get_vendors() 
         
         if "admin_match_results" not in st.session_state:
             st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
     
-    # NEW: Added Vendors Approval tab and Statistics tab
+    # Added Vendors Approval tab and Statistics tab
     tab_jd, tab_analysis, tab_candidate_approval, tab_vendor_approval, tab_metrics, tab_settings = st.tabs(
         ["📄 JD Management", "📊 Resume Analysis", "✅ Candidate Approval", "🤝 Vendors Approval", "📈 Statistics", "⚙️ Settings"]
     )
@@ -1034,12 +1101,12 @@ def admin_dashboard():
                     st.markdown(item['full_analysis'])
 
     
-    # --- TAB 3: Candidate Approval ---
+    # --- TAB 3: Candidate Approval (FIXED LOGIC) ---
     with tab_candidate_approval:
         st.subheader("Review and Approve Candidate Resumes")
         st.markdown("Use this list to set the review status for analyzed resumes.")
 
-        # Re-load resumes to ensure we have the latest status from DB
+        # CRITICAL FIX: Always re-load resumes when this tab is active or rerun
         if st.session_state.db.is_connected():
             st.session_state.resumes_to_analyze = st.session_state.db.get_resumes() 
         
@@ -1053,9 +1120,23 @@ def admin_dashboard():
             # Define status options
             STATUS_OPTIONS = ["Pending", "Approved", "Rejected", "Contacted"]
 
+            # Function to update the status in MongoDB (defined inside the dashboard scope)
+            def update_resume_status(r_id, status, r_name):
+                if st.session_state.db.is_connected():
+                    # 1. Update the status in the MongoDB database
+                    st.session_state.db.db.admin_resumes.update_one(
+                        {'_id': ObjectId(r_id)},
+                        {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
+                    )
+                    st.toast(f"Status for {r_name} updated to {status}!")
+                    
+                    # 2. <<< CRITICAL FIX: IMMEDIATELY RELOAD THE LIST FROM DB >>>
+                    st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+
+                st.rerun() # Rerun the app to reflect the session state change
+
             for resume_data in resumes_list:
                 resume_id = resume_data['_id']
-                # Ensure a default status is always present
                 current_status = resume_data.get('status', 'Pending') 
                 resume_name = resume_data.get('name', 'N/A')
                 
@@ -1077,18 +1158,6 @@ def admin_dashboard():
                     )
                 
                 with col_button:
-                    # Function to update the status in MongoDB
-                    def update_resume_status(r_id, status, r_name):
-                        if st.session_state.db.is_connected():
-                            # Update only the status field in the admin_resumes collection
-                            st.session_state.db.db.admin_resumes.update_one(
-                                {'_id': ObjectId(r_id)},
-                                {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
-                            )
-                            st.toast(f"Status for {r_name} updated to {status}!")
-                        st.rerun() # Rerun to refresh the list and show the new status
-
-                    # Update button with callback
                     # Only show the update button if the status has actually changed
                     if new_status != current_status:
                         if st.session_state.db.is_connected():
@@ -1141,7 +1210,7 @@ def admin_dashboard():
 
         st.markdown("#### Vendor Status List")
         
-        # FIX: Reload vendor list every time the tab is active, but only if connected
+        # Reload vendor list every time the tab is active, but only if connected
         if st.session_state.db.is_connected():
             st.session_state.vendor_list = st.session_state.db.get_vendors() 
         else:
@@ -1207,7 +1276,7 @@ def admin_dashboard():
                 
                 st.markdown("---")
                 
-    # --- TAB 5: Statistics (NEW TAB) ---
+    # --- TAB 5: Statistics (ADDED LATEST APPLICATIONS) ---
     with tab_metrics:
         st.subheader("Platform Metrics")
         
@@ -1248,6 +1317,33 @@ def admin_dashboard():
         display_metric(col_social, "No. of Social Media Posts", metrics["no_of_social_media_posts"])
         
         st.markdown("---")
+        
+        # --- NEW SECTION: Latest Applications ---
+        st.subheader("Recent Match Results (Latest 10 Applications/Matches)")
+        
+        if st.session_state.db.is_connected():
+            # Get the combined list of latest matches
+            latest_matches = st.session_state.db.get_latest_applications(limit=10)
+            
+            if latest_matches:
+                display_data = []
+                for item in latest_matches:
+                    display_data.append({
+                        "Time": item.get('created_at', 'N/A'),
+                        "Resume": item.get("resume_name", "N/A"),
+                        "JD Matched Against": item.get("jd_name", "N/A"),
+                        "Score": f"{item.get('overall_score', 'N/A')}/10",
+                        "Source": item.get("Source", "N/A"), # Admin for manual runs, Candidate for candidate runs
+                    })
+                
+                # Display the data as a table
+                st.dataframe(display_data, use_container_width=True)
+            else:
+                st.info("No applications or match analyses have been run yet.")
+        else:
+            st.warning("Database is disconnected. Cannot fetch latest application data.")
+            
+        st.markdown("---")
         st.info("Note: 'Total Resumes' counts unique resumes uploaded by Admin for analysis. 'Total JDs' aggregates JDs added by both Admin and Candidates.")
 
 
@@ -1255,6 +1351,45 @@ def admin_dashboard():
     with tab_settings:
         st.subheader("Database Settings")
         st.warning("Use these options with caution, as they affect persistent data.")
+        
+        st.markdown("#### Manually Update Social Media Counter")
+        
+        if 'social_media_posts_change' not in st.session_state:
+            st.session_state.social_media_posts_change = 0
+            
+        # Create a number input widget (resembling the image)
+        st.markdown("Change Social Media Posts Counter By")
+        change_by = st.number_input(
+            "Change Social Media Posts Counter By", 
+            min_value=-999999, 
+            value=st.session_state.social_media_posts_change, 
+            step=1,
+            label_visibility="collapsed"
+        )
+        st.session_state.social_media_posts_change = change_by # Keep the state updated
+        
+        def handle_social_media_update():
+            if not st.session_state.db.is_connected():
+                st.error("Cannot update counter: Database is not connected.")
+                return
+            
+            # The change_by is stored in session_state when the number_input changes
+            change = st.session_state.social_media_posts_change 
+            
+            if change != 0:
+                new_count = st.session_state.db.update_social_media_posts_count(change)
+                st.success(f"Social Media Posts counter updated by {change}. New count: {new_count}")
+                # Reset the input field to 0 after update
+                st.session_state.social_media_posts_change = 0 
+            else:
+                st.info("No change specified (Value is 0).")
+            st.rerun() # Rerun to refresh the statistics display
+
+        # Button matching the image
+        if st.button("Update Counters", on_click=handle_social_media_update):
+            pass # The action is handled by the on_click callback
+
+        st.markdown("---")
         
         if st.button("🔄 Reload All Data from MongoDB", key="reload_db_admin"):
             if st.session_state.db.is_connected():
@@ -1285,7 +1420,7 @@ def candidate_dashboard():
 
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
     
-    # NEW: Check DB connection status
+    # Check DB connection status
     if 'db' not in st.session_state or not st.session_state.db.is_connected():
         st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
         # FIX: Initialize lists to empty if DB is not connected
@@ -1687,6 +1822,7 @@ def main():
         st.session_state.qa_answer = ""
         st.session_state.iq_output = ""
         st.session_state.jd_fit_output = ""
+        st.session_state.social_media_posts_change = 0 # Social media counter input state
         
         # Reset lists if a hard restart occurs, lists will be loaded from DB in respective dashboards
         # They are initialized here but populated inside the dashboards to ensure they are fresh
