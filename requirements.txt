@@ -1,11 +1,7 @@
 streamlit
 groq
+pymongo
+python-dotenv
 pdfplumber
 python-docx
 openpyxl
-gtts
-python-dotenv
-PyPDF2
-docx2txt 
-requests 
-pymongo
