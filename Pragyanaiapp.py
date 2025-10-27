@@ -6,209 +6,346 @@ import openpyxl
 import json
 import tempfile
 from groq import Groq
-from gtts import gTTS
 import traceback
 import re
-import datetime
-from typing import List, Dict, Any
 from dotenv import load_dotenv 
-
-# MongoDB dependencies
 from pymongo import MongoClient
-from bson.objectid import ObjectId
-
-# -------------------------
-# DATABASE CONNECTOR (db_connector.py content combined here)
-# -------------------------
-
-@st.cache_resource
-def get_db_client():
-    """Initializes and caches the MongoDB client."""
-    try:
-        # Check for required secrets keys
-        if "mongo" not in st.secrets or "uri" not in st.secrets["mongo"]:
-             st.error("MongoDB configuration missing. Check '.streamlit/secrets.toml'.")
-             return None
-             
-        uri = st.secrets["mongo"]["uri"]
-        client = MongoClient(uri)
-        # Verify connection
-        client.admin.command('ping') 
-        return client
-    except Exception as e:
-        st.error(f"Error connecting to MongoDB. Check URI and network access. Details: {e}")
-        return None
-
-db_client = get_db_client()
-
-def get_collection(collection_key: str):
-    """Generic function to retrieve a specific collection."""
-    if db_client:
-        try:
-            db_name = st.secrets["mongo"]["database"]
-            coll_name = st.secrets["mongo"][collection_key]
-            return db_client[db_name][coll_name]
-        except KeyError:
-            # st.error(f"Missing collection key '{collection_key}' in secrets.toml.")
-            return None
-    return None
-
-resumes_collection = get_collection("resumes_collection")
-vendors_collection = get_collection("vendors_collection")
-
-# --- Resumes/Candidates CRUD Operations ---
-
-def fetch_all_resumes() -> List[Dict[str, Any]]:
-    """Fetches all candidate documents from the resumes collection."""
-    if resumes_collection is None:
-        return []
-    
-    candidates_cursor = resumes_collection.find().sort("_id", -1) 
-    candidates_list = list(candidates_cursor)
-    
-    for candidate in candidates_list:
-        candidate['id'] = str(candidate['_id'])
-        if 'status' not in candidate:
-            candidate['status'] = 'Pending'
-        if not candidate.get('name'):
-            candidate['name'] = candidate.get('original_file_name', 'Unknown Candidate')
-    
-    return candidates_list
-
-def insert_new_resume(resume_data: dict) -> ObjectId | None:
-    """Inserts a new parsed resume document."""
-    if resumes_collection is None:
-        return None
-    
-    data_to_insert = {
-        'parsed': resume_data.get('parsed'),
-        'full_text': resume_data.get('full_text'),
-        'name': resume_data.get('name'),
-        'original_file_name': resume_data.get('original_file_name'),
-        'status': resume_data.get('status', 'Pending'),
-        'upload_date': datetime.datetime.utcnow()
-    }
-    
-    try:
-        result = resumes_collection.insert_one(data_to_insert)
-        return result.inserted_id
-    except Exception as e:
-        st.error(f"MongoDB resume insertion failed: {e}")
-        return None
-
-def update_resume_status(resume_mongo_id: str, new_status: str, approver_name: str) -> int:
-    """Updates the status of a single candidate in the database."""
-    if resumes_collection is None:
-        return 0
-        
-    try:
-        object_id = ObjectId(resume_mongo_id)
-        
-        filter_query = { '_id': object_id }
-        
-        update_action = {
-            '$set': {
-                'status': new_status,
-                'reviewed_by': approver_name,
-                'reviewed_date': datetime.datetime.utcnow()
-            }
-        }
-        
-        result = resumes_collection.update_one(filter_query, update_action)
-        return result.modified_count
-        
-    except Exception as e:
-        st.error(f"Database update failed for Resume ID {resume_mongo_id}: {e}")
-        return 0
-        
-# --- Vendors CRUD Operations ---
-
-def fetch_all_vendors() -> List[Dict[str, Any]]:
-    """Fetches all vendor documents from the vendors collection."""
-    if vendors_collection is None:
-        return []
-    
-    vendors_cursor = vendors_collection.find().sort("_id", -1) 
-    vendors_list = list(vendors_cursor)
-    
-    for vendor in vendors_list:
-        vendor['id'] = str(vendor['_id'])
-        if 'status' not in vendor:
-            vendor['status'] = 'Pending'
-    
-    return vendors_list
-
-def insert_new_vendor(vendor_name: str, vendor_domain: str) -> ObjectId | None:
-    """Inserts a new vendor document."""
-    if vendors_collection is None:
-        return None
-        
-    data_to_insert = {
-        'name': vendor_name.strip(),
-        'domain': vendor_domain.strip(),
-        'status': 'Pending',
-        'added_date': datetime.datetime.utcnow()
-    }
-    
-    try:
-        # Optional: Check for duplicates before inserting
-        if vendors_collection.find_one({'name': vendor_name.strip(), 'domain': vendor_domain.strip()}):
-             st.warning(f"Vendor '{vendor_name}' already exists.")
-             return None
-
-        result = vendors_collection.insert_one(data_to_insert)
-        return result.inserted_id
-    except Exception as e:
-        st.error(f"MongoDB vendor insertion failed: {e}")
-        return None
-
-def update_vendor_status(vendor_mongo_id: str, new_status: str) -> int:
-    """Updates the status of a single vendor in the database."""
-    if vendors_collection is None:
-        return 0
-        
-    try:
-        object_id = ObjectId(vendor_mongo_id)
-        
-        filter_query = { '_id': object_id }
-        
-        update_action = {
-            '$set': {
-                'status': new_status,
-                'reviewed_date': datetime.datetime.utcnow()
-            }
-        }
-        
-        result = vendors_collection.update_one(filter_query, update_action)
-        return result.modified_count
-        
-    except Exception as e:
-        st.error(f"Database update failed for Vendor ID {vendor_mongo_id}: {e}")
-        return 0
-
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
+from bson.objectid import ObjectId # <<< CRITICAL FIX: Ensure ObjectId is imported correctly
+from datetime import datetime
 
 # -------------------------
 # CONFIGURATION & API SETUP
 # -------------------------
 
+# CRITICAL FIX: Using the currently supported Groq model.
 GROQ_MODEL = "llama-3.1-8b-instant"
 
+# Options for LLM functions
 section_options = ["name", "email", "phone", "skills", "education", "experience", "certifications", "projects", "strength", "personal_details", "github", "linkedin", "full resume"]
 question_section_options = ["skills","experience", "certifications", "education", "projects"]
-answer_types = [("Point-wise", "points"), ("Detailed", "detailed"), ("Key Points", "key")]
 
+# Load environment variables from .env file
 load_dotenv()
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+MONGODB_URI = os.getenv('MONGODB_URI') 
+
+# --- CRITICAL ENVIRONMENT VARIABLE CHECK ---
 if not GROQ_API_KEY:
     st.error(
         "🚨 FATAL ERROR: GROQ_API_KEY environment variable not set. "
-        "Please ensure a '.env' file exists in the script directory with this line: "
-        "GROQ_API_KEY=\"YOUR_KEY_HERE\""
+        "Please ensure a '.env' file exists in the script directory with your key."
     )
     st.stop()
 
+if not MONGODB_URI:
+    st.error(
+        "🚨 FATAL ERROR: MONGODB_URI environment variable not set. "
+        "The application requires a MongoDB connection. Please check your '.env' file."
+    )
+    st.stop()
+# --- END ENVIRONMENT VARIABLE CHECK ---
+
+# Initialize Groq Client
 client = Groq(api_key=GROQ_API_KEY)
+
+# -------------------------
+# MongoDB Database Manager
+# -------------------------
+
+class DatabaseManager:
+    """Handles connection and CRUD operations for MongoDB."""
+    def __init__(self, uri):
+        self.client = None
+        self.db = None
+        
+        # Use st.cache_resource for the connection client
+        @st.cache_resource(ttl=3600)
+        def init_connection(mongo_uri):
+            try:
+                # Add server selection timeout to prevent infinite hangs
+                client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5500)
+                # Attempt a quick command to verify connection and configuration
+                client.admin.command('ping') 
+                
+                # CRITICAL FIX: Check for default database before returning
+                client.get_default_database() 
+                
+                return client
+            except ConfigurationError as e:
+                # Catch the specific error about the missing database name
+                print(f"MongoDB Configuration Error: {e}")
+                st.error(
+                    "❌ MongoDB Configuration Error: The connection string is missing the database name. "
+                    "Ensure your MONGODB_URI format is correct: "
+                    "`mongodb+srv://user:pass@cluster.mongodb.net/DATABASE_NAME?query`"
+                )
+                return None
+            except (PyMongoConnectionError, Exception) as e:
+                # Catch general connection errors (auth, network, etc.)
+                error_detail = str(e)
+                if 'bad auth' in error_detail:
+                    st.error("❌ MongoDB Connection Error: Authentication failed (Bad Auth). Check MONGODB_URI username and password.")
+                else:
+                    st.error(f"❌ MongoDB Connection Error: Failed to connect. Check MONGODB_URI and network access. Error: {e}")
+                print(f"MongoDB Connection Error: {e}")
+                return None
+
+        self.client = init_connection(uri)
+        if self.client:
+            try:
+                # Get the default database name specified in the connection string
+                self.db = self.client.get_default_database()
+            except ConfigurationError:
+                # This should be caught by init_connection, but included for robustness
+                self.db = None
+        
+    def is_connected(self):
+        # Checks if both the client and the database object were successfully initialized
+        return self.client is not None and self.db is not None
+        
+    # --- JD Management ---
+    def save_jd(self, jd_data, user_role):
+        if not self.is_connected(): return None
+        collection = self.db[f'{user_role}_jds']
+        # Use name and content hash to check for duplicates, simpler check here
+        existing_jd = collection.find_one({'name': jd_data['name'], 'content': jd_data['content']})
+        
+        # Add timestamp for tracking
+        jd_data['updated_at'] = datetime.utcnow()
+        
+        if existing_jd:
+            # Update existing JD (though usually not necessary for JDs)
+            collection.update_one({'_id': existing_jd['_id']}, {'$set': jd_data})
+            return existing_jd['_id']
+        else:
+            jd_data['created_at'] = datetime.utcnow()
+            result = collection.insert_one(jd_data)
+            return result.inserted_id
+
+    def get_jds(self, user_role):
+        if not self.is_connected(): return []
+        collection = self.db[f'{user_role}_jds']
+        jds = list(collection.find({}).sort('created_at', -1))
+        # Convert ObjectId to string for safe handling in Streamlit
+        for jd in jds:
+            jd['_id'] = str(jd['_id'])
+        return jds
+        
+    # --- Resume Management (Admin) ---
+    def save_resume(self, resume_data):
+        if not self.is_connected(): return None
+        collection = self.db['admin_resumes']
+        
+        resume_name = resume_data['name']
+        resume_data['updated_at'] = datetime.utcnow()
+
+        # Add default status if not present
+        if 'status' not in resume_data:
+            resume_data['status'] = 'Pending'
+        
+        # Check for resume with the same name
+        existing_resume = collection.find_one({'name': resume_name})
+        if existing_resume:
+            # Preserve existing 'status' if not explicitly provided in resume_data
+            if 'status' in existing_resume:
+                resume_data['status'] = existing_resume['status']
+            
+            collection.update_one({'_id': existing_resume['_id']}, {'$set': resume_data})
+            return existing_resume['_id']
+        else:
+            resume_data['created_at'] = datetime.utcnow()
+            result = collection.insert_one(resume_data)
+            return result.inserted_id
+
+    def get_resumes(self):
+        if not self.is_connected(): return []
+        collection = self.db['admin_resumes']
+        resumes = list(collection.find({}).sort('created_at', -1))
+        for resume in resumes:
+            resume['_id'] = str(resume['_id'])
+            # Ensure status is present for the approval tab
+            if 'status' not in resume:
+                resume['status'] = 'Pending' 
+        return resumes
+        
+    # --- Vendor Management (New) ---
+    def save_vendor(self, vendor_data):
+        if not self.is_connected(): return None
+        collection = self.db['vendors']
+        
+        # Check for vendor with the same name/contact
+        existing_vendor = collection.find_one({
+            '$or': [{'name': vendor_data['name']}, {'contact_email': vendor_data['contact_email']}]
+        })
+        
+        vendor_data['updated_at'] = datetime.utcnow()
+        if 'status' not in vendor_data:
+            vendor_data['status'] = 'Pending'
+            
+        if existing_vendor:
+            # Update existing vendor data
+            collection.update_one({'_id': existing_vendor['_id']}, {'$set': vendor_data})
+            return existing_vendor['_id']
+        else:
+            vendor_data['created_at'] = datetime.utcnow()
+            result = collection.insert_one(vendor_data)
+            return result.inserted_id
+
+    def get_vendors(self):
+        if not self.is_connected(): return []
+        collection = self.db['vendors']
+        vendors = list(collection.find({}).sort('created_at', -1))
+        for vendor in vendors:
+            vendor['_id'] = str(vendor['_id'])
+            if 'status' not in vendor:
+                vendor['status'] = 'Pending' 
+        return vendors
+
+        
+    # --- Match Results (Admin and Candidate) ---
+    def save_match_result(self, result_data, user_role):
+        if not self.is_connected(): return None
+        collection = self.db[f'{user_role}_match_results']
+        result_data['created_at'] = datetime.utcnow()
+        result = collection.insert_one(result_data)
+        return result.inserted_id
+        
+    def get_match_results(self, user_role):
+        if not self.is_connected(): return []
+        collection = self.db[f'{user_role}_match_results']
+        # Get the last 50 results (or fewer)
+        results = list(collection.find({}).sort('created_at', -1).limit(50)) 
+        for result in results:
+            result['_id'] = str(result['_id'])
+            # Format the datetime for display
+            if 'created_at' in result:
+                result['created_at_str'] = result['created_at'].strftime("%Y-%m-%d %H:%M")
+        return results
+
+    # --- Platform Metrics ---
+    def get_platform_metrics(self):
+        """Calculates key counts for the platform."""
+        if not self.is_connected():
+            return {
+                "total_candidates": 0,
+                "total_jds": 0,
+                "total_vendors": 0,
+                "no_of_applications": 0,
+                "no_of_social_media_posts": 0 
+            }
+
+        # Count unique candidates (resumes)
+        total_candidates = self.db['admin_resumes'].count_documents({})
+        
+        # Count all job descriptions (Admin and Candidate)
+        total_jds = self.db['admin_jds'].count_documents({}) + self.db['candidate_jds'].count_documents({})
+        
+        # Count total vendors
+        total_vendors = self.db['vendors'].count_documents({})
+        
+        # Count total match results (applications/analyses run)
+        no_of_applications = self.db['admin_match_results'].count_documents({}) + self.db['candidate_match_results'].count_documents({})
+
+        # Fetch Social Media Posts counter from a dedicated metrics collection
+        metrics_collection = self.db['platform_metrics']
+        metrics_doc = metrics_collection.find_one({'_id': 'social_media_counter'})
+        no_of_social_media_posts = metrics_doc.get('count', 0) if metrics_doc else 0
+
+        return {
+            "total_candidates": total_candidates,
+            "total_jds": total_jds,
+            "total_vendors": total_vendors,
+            "no_of_applications": no_of_applications,
+            "no_of_social_media_posts": no_of_social_media_posts
+        }
+    
+    # --- NEW: Update Social Media Counter ---
+    def update_social_media_posts_count(self, change_by):
+        """Updates the social media posts counter in the dedicated metrics document."""
+        if not self.is_connected(): return 0
+        
+        metrics_collection = self.db['platform_metrics']
+        
+        # Use find_one_and_update with upsert=True to create the document if it doesn't exist
+        # and atomically update the count.
+        result = metrics_collection.find_one_and_update(
+            {'_id': 'social_media_counter'},
+            {
+                '$inc': {'count': change_by}, # Increment or decrement the 'count' field
+                '$set': {'updated_at': datetime.utcnow()}
+            },
+            upsert=True,
+            return_document='after' # Return the updated document
+        )
+        
+        # Handle case where the counter might go below zero (optional, but good practice)
+        if result and result['count'] < 0:
+            # Set it back to 0 if it dipped negative
+            metrics_collection.update_one(
+                {'_id': 'social_media_counter'},
+                {'$set': {'count': 0}}
+            )
+            return 0
+            
+        return result.get('count', 0) if result else 0
+
+    # --- NEW: Get Latest Applications/Matches ---
+    def get_latest_applications(self, limit=10):
+        """Fetches the latest match results from both admin and candidate collections."""
+        if not self.is_connected(): return []
+        
+        # Aggregate results from both collections
+        pipeline = [
+            # UnionWith is the MongoDB 4.4+ way to combine collections
+            {
+                '$unionWith': {
+                    'coll': 'candidate_match_results',
+                    'pipeline': [
+                        {'$addFields': {'Source': 'Candidate'}}, # Tag the source
+                    ]
+                }
+            },
+            {'$addFields': {'Source': {'$ifNull': ['$Source', 'Admin']}}}, # Tag the original collection (Admin)
+            {'$sort': {'created_at': -1}}, # Sort by newest first
+            {'$limit': limit}, # Limit the results
+            {'$project': { # Select and format fields
+                '_id': {'$toString': '$_id'},
+                'resume_name': 1,
+                'jd_name': 1,
+                'overall_score': 1,
+                'Source': 1,
+                'created_at': {'$dateToString': {'format': "%Y-%m-%d %H:%M", 'date': "$created_at"}}
+            }}
+        ]
+
+        # Use the aggregation framework on one of the collections
+        # Since we use $unionWith, it doesn't matter which one we start with.
+        results = list(self.db['admin_match_results'].aggregate(pipeline))
+        
+        return results
+
+    # --- Utility: Clear all data (for demo/admin) ---
+    def clear_all_data(self):
+        if not self.is_connected(): return
+        
+        # Clear all application-specific collections
+        self.db.admin_jds.drop()
+        self.db.candidate_jds.drop()
+        self.db.admin_resumes.drop()
+        self.db.admin_match_results.drop()
+        self.db.candidate_match_results.drop()
+        self.db.vendors.drop() 
+        self.db.platform_metrics.drop() # <-- Drop platform metrics collection
+        
+        # Reset session state lists (will be reloaded on next dashboard entry)
+        if 'admin_jd_list' in st.session_state: st.session_state.admin_jd_list = []
+        if 'resumes_to_analyze' in st.session_state: st.session_state.resumes_to_analyze = []
+        if 'admin_match_results' in st.session_state: st.session_state.admin_match_results = []
+        if 'candidate_jd_list' in st.session_state: st.session_state.candidate_jd_list = []
+        if 'candidate_match_results' in st.session_state: st.session_state.candidate_match_results = []
+        if 'vendor_list' in st.session_state: st.session_state.vendor_list = []
 
 
 # -------------------------
@@ -262,10 +399,6 @@ def extract_content(file_type, file_path):
     
     except Exception as e:
         return f"Fatal Extraction Error: Failed to read file content. Error details: {e}"
-
-# -------------------------
-# LLM & Extraction Functions
-# -------------------------
 
 @st.cache_data(show_spinner="Analyzing content with Groq LLM...")
 def parse_with_llm(text, return_type='json'):
@@ -335,6 +468,7 @@ def parse_with_llm(text, return_type='json'):
                     for sub_k, sub_v in v.items():
                         if sub_v:
                             md += f"  - {sub_k.replace('_', ' ').title()}: {sub_v}\n"
+                    
                 else:
                     md += f"  {v}\n"
                 md += "\n"
@@ -343,7 +477,10 @@ def parse_with_llm(text, return_type='json'):
 
 
 def extract_jd_from_linkedin_url(url: str) -> str:
-    """Simulates JD content extraction from a LinkedIn URL."""
+    """
+    Simulates JD content extraction from a LinkedIn URL.
+    This simulation is used for robustness in a pure Streamlit environment.
+    """
     try:
         job_title = "Data Scientist"
         try:
@@ -357,6 +494,7 @@ def extract_jd_from_linkedin_url(url: str) -> str:
              return f"[Error: Not a valid LinkedIn Job URL format: {url}]"
 
         
+        # Simulated synthesized JD content 
         jd_text = f"""
         --- Simulated JD for: {job_title} ---
         
@@ -472,7 +610,7 @@ def dump_to_excel(parsed_json, filename):
         return f.read()
 
 def parse_and_store_resume(uploaded_file, file_name_key='default'):
-    """Handles file upload, parsing, and stores results either in session state (Candidate) or DB (Admin)."""
+    """Handles file upload, parsing, and stores results in session state and DB."""
     
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, uploaded_file.name)
@@ -490,38 +628,33 @@ def parse_and_store_resume(uploaded_file, file_name_key='default'):
     if not parsed or "error" in parsed:
         return {"error": parsed.get('error', 'Unknown parsing error'), "full_text": text}
 
-    resume_data = {
-        "parsed": parsed,
-        "full_text": text,
-        "name": parsed.get('name', uploaded_file.name.split('.')[0]),
-        "original_file_name": uploaded_file.name,
-        "status": "Pending" 
-    }
-    
+    # Generate Excel data for download
     excel_data = None
     if file_name_key == 'single_resume_candidate':
         try:
-            name = resume_data['name'].replace(' ', '_').strip()
+            name = parsed.get('name', 'candidate').replace(' ', '_').strip()
             name = "".join(c for c in name if c.isalnum() or c in ('_', '-')).rstrip()
             if not name: name = "candidate"
             excel_filename = os.path.join(tempfile.gettempdir(), f"{name}_parsed_data.xlsx")
             excel_data = dump_to_excel(parsed, excel_filename)
         except Exception as e:
             st.warning(f"Could not generate Excel file for single resume: {e}")
-            
-        resume_data["excel_data"] = excel_data
+    
+    # NEW: Store resume data in MongoDB if it's an Admin upload
+    if file_name_key == 'admin_analysis' and st.session_state.db.is_connected():
+        resume_data_to_store = {
+            "name": parsed.get('name', uploaded_file.name.split('.')[0]),
+            "parsed": parsed,
+            "full_text": text
+        }
+        st.session_state.db.save_resume(resume_data_to_store)
         
-    # DB INSERTION LOGIC
-    if file_name_key == 'admin_analysis':
-        inserted_id = insert_new_resume(resume_data)
-        if inserted_id:
-            resume_data["id"] = str(inserted_id)
-            return {"success": True, "name": resume_data["name"]}
-        else:
-            return {"error": "Failed to save resume to database."}
-
-    # Candidate upload: Return data for session state
-    return resume_data
+    return {
+        "parsed": parsed,
+        "full_text": text,
+        "excel_data": excel_data,
+        "name": parsed.get('name', uploaded_file.name.split('.')[0])
+    }
 
 
 def qa_on_resume(question):
@@ -636,30 +769,39 @@ def role_selection_page():
 def admin_dashboard():
     st.header("🧑‍💼 Admin Dashboard")
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
-
-    if db_client is None:
-        st.error("Cannot connect to MongoDB. Admin functions are disabled. Check `.streamlit/secrets.toml`.")
-        return
     
-    # Fetch all current persistent data
-    all_resumes = fetch_all_resumes()
-    all_vendors = fetch_all_vendors()
+    # Check DB connection status
+    if 'db' not in st.session_state or not st.session_state.db.is_connected():
+        st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
+        
+        st.session_state.admin_jd_list = []
+        st.session_state.resumes_to_analyze = []
+        st.session_state.vendor_list = []
+        st.session_state.admin_match_results = []
     
-    if "admin_jd_list" not in st.session_state: st.session_state.admin_jd_list = []
-    if "admin_match_results" not in st.session_state: st.session_state.admin_match_results = []
-    if "applications_count" not in st.session_state: st.session_state.applications_count = len(all_resumes)
-    if "social_media_posts" not in st.session_state: st.session_state.social_media_posts = 0
-
+    # Initialize Admin session state variables and load from DB
+    if st.session_state.db.is_connected():
+        if "admin_jd_list" not in st.session_state:
+            st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
+        
+        # Resumes must be reloaded to get the latest status
+        # This will be re-fetched in tab_candidate_approval explicitly for immediate feedback.
+        if "resumes_to_analyze" not in st.session_state:
+            st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+        
+        # Initialize Vendor list
+        if "vendor_list" not in st.session_state:
+            st.session_state.vendor_list = st.session_state.db.get_vendors() 
+        
+        if "admin_match_results" not in st.session_state:
+            st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
     
-    tab_jd, tab_analysis, tab_candidate, tab_vendor, tab_overview = st.tabs([
-        "📄 Job Description Management", 
-        "📊 Resume Analysis", 
-        "✅ Candidate Approval", 
-        "🤝 Vendor Approval", 
-        "🚀 Dashboard Overview"
-    ])
+    # Added Vendors Approval tab and Statistics tab
+    tab_jd, tab_analysis, tab_candidate_approval, tab_vendor_approval, tab_metrics, tab_settings = st.tabs(
+        ["📄 JD Management", "📊 Resume Analysis", "✅ Candidate Approval", "🤝 Vendors Approval", "📈 Statistics", "⚙️ Settings"]
+    )
 
-    # --- TAB 1: JD Management (Session based) ---
+    # --- TAB 1: JD Management ---
     with tab_jd:
         st.subheader("Add and Manage Job Descriptions (JD)")
         
@@ -668,39 +810,64 @@ def admin_dashboard():
         
         method = st.radio("Choose Method", ["Upload File", "Paste Text", "LinkedIn URL"], key="jd_add_method_admin") 
 
+        # URL
         if method == "LinkedIn URL":
             url_list = st.text_area(
                 "Enter one or more URLs (comma separated)" if jd_type == "Multiple JD" else "Enter URL", key="url_list_admin"
             )
             if st.button("Add JD(s) from URL", key="add_jd_url_btn_admin"):
-                if url_list:
+                if st.session_state.db.is_connected() and url_list:
                     urls = [u.strip() for u in url_list.split(",")] if jd_type == "Multiple JD" else [url_list.strip()]
+                    
                     count = 0
                     for url in urls:
                         if not url: continue
+                        
                         with st.spinner(f"Attempting JD extraction for: {url}"):
                             jd_text = extract_jd_from_linkedin_url(url)
+                        
                         name_base = url.split('/jobs/view/')[-1].split('/')[0] if '/jobs/view/' in url else f"URL {count+1}"
-                        st.session_state.admin_jd_list.append({"name": f"JD from URL: {name_base}", "content": jd_text})
-                        if not jd_text.startswith("[Error"): count += 1
-                    if count > 0: st.success(f"✅ {count} JD(s) added successfully!")
-                    else: st.error("No JDs were added successfully.")
+                        if not jd_text.startswith("[Error"):
+                            # Save to DB
+                            jd_data = {"name": f"JD from URL: {name_base}", "content": jd_text, "source": "url"}
+                            st.session_state.db.save_jd(jd_data, 'admin')
+                            count += 1
+                            
+                    # Refresh list from DB
+                    st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
+                    if count > 0:
+                        st.success(f"✅ {count} JD(s) added successfully!")
+                    else:
+                        st.error("No JDs were added successfully.")
+                elif not st.session_state.db.is_connected():
+                    st.error("Cannot add JD: Database is not connected.")
 
+
+        # Paste Text
         elif method == "Paste Text":
             text_list = st.text_area(
                 "Paste one or more JD texts (separate by '---')" if jd_type == "Multiple JD" else "Paste JD text here", key="text_list_admin"
             )
             if st.button("Add JD(s) from Text", key="add_jd_text_btn_admin"):
-                if text_list:
+                if st.session_state.db.is_connected() and text_list:
                     texts = [t.strip() for t in text_list.split("---")] if jd_type == "Multiple JD" else [text_list.strip()]
                     for i, text in enumerate(texts):
                          if text:
                             name_base = text.splitlines()[0].strip()
                             if len(name_base) > 30: name_base = f"{name_base[:27]}..."
                             if not name_base: name_base = f"Pasted JD {len(st.session_state.admin_jd_list) + i + 1}"
-                            st.session_state.admin_jd_list.append({"name": name_base, "content": text})
+                            
+                            # Save to DB
+                            jd_data = {"name": name_base, "content": text, "source": "pasted"}
+                            st.session_state.db.save_jd(jd_data, 'admin')
+                            
+                    # Refresh list from DB
+                    st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
                     st.success(f"✅ {len(texts)} JD(s) added successfully!")
+                elif not st.session_state.db.is_connected():
+                    st.error("Cannot add JD: Database is not connected.")
 
+        # Upload File
         elif method == "Upload File":
             uploaded_files = st.file_uploader(
                 "Upload JD file(s)",
@@ -709,38 +876,64 @@ def admin_dashboard():
                 key="jd_file_uploader_admin"
             )
             if st.button("Add JD(s) from File", key="add_jd_file_btn_admin"):
-                files_to_process = uploaded_files if jd_type == "Multiple JD" and uploaded_files else [uploaded_files]
-                count = 0
-                for file in files_to_process:
-                    if file:
-                        temp_dir = tempfile.mkdtemp()
-                        temp_path = os.path.join(temp_dir, file.name)
-                        with open(temp_path, "wb") as f:
-                            f.write(file.getbuffer())
-                        file_type = get_file_type(temp_path)
-                        jd_text = extract_content(file_type, temp_path)
-                        if not jd_text.startswith("Error"):
-                            st.session_state.admin_jd_list.append({"name": file.name, "content": jd_text})
-                            count += 1
-                if count > 0: st.success(f"✅ {count} JD(s) added successfully!")
-                else: st.error("No valid JD files were uploaded or content extraction failed.")
+                if st.session_state.db.is_connected():
+                    files_to_process = uploaded_files if jd_type == "Multiple JD" and uploaded_files else [uploaded_files]
+                    count = 0
+                    for file in files_to_process:
+                        if file:
+                            temp_dir = tempfile.mkdtemp()
+                            temp_path = os.path.join(temp_dir, file.name)
+                            with open(temp_path, "wb") as f:
+                                f.write(file.getbuffer())
+                                
+                            file_type = get_file_type(temp_path)
+                            jd_text = extract_content(file_type, temp_path)
+                            
+                            if not jd_text.startswith("Error"):
+                                # Save to DB
+                                jd_data = {"name": file.name, "content": jd_text, "source": "file"}
+                                st.session_state.db.save_jd(jd_data, 'admin')
+                                count += 1
+                                
+                    # Refresh list from DB
+                    st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
+                    if count > 0:
+                        st.success(f"✅ {count} JD(s) added successfully!")
+                    else:
+                        st.error("No valid JD files were uploaded or content extraction failed.")
+                elif not st.session_state.db.is_connected():
+                    st.error("Cannot add JD: Database is not connected.")
 
+
+        # Display Added JDs
         if st.session_state.admin_jd_list:
-            st.markdown("### ✅ Current JDs Added:")
+            st.markdown("### ✅ Current JDs Added (Persistent in DB):")
             for idx, jd_item in enumerate(st.session_state.admin_jd_list, 1):
                 title = jd_item['name']
                 display_title = title.replace("--- Simulated JD for: ", "")
-                with st.expander(f"JD {idx}: {display_title}"):
-                    st.text(jd_item['content'])
+                col_disp, col_del = st.columns([10, 1])
+                with col_disp:
+                    with st.expander(f"JD {idx}: {display_title} (Added: {jd_item.get('created_at', 'N/A').strftime('%Y-%m-%d')})"):
+                        st.text(jd_item['content'])
+                with col_del:
+                    if st.button("🗑️", key=f"del_jd_admin_{jd_item['_id']}"):
+                        if st.session_state.db.is_connected():
+                            st.session_state.db.db.admin_jds.delete_one({'_id': ObjectId(jd_item['_id'])})
+                            # Refresh list immediately after deletion
+                            st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
+                            st.rerun()
+                        else:
+                            st.error("Cannot delete: Database is not connected.")
         else:
             st.info("No Job Descriptions added yet.")
 
 
-    # --- TAB 2: Resume Analysis (Upload saves to DB, analysis uses DB read) ---
+    # --- TAB 2: Resume Analysis (Admin logic) ---
     with tab_analysis:
         st.subheader("Analyze Resumes Against Job Descriptions")
 
-        st.markdown("#### 1. Upload Resumes (Saves to Database)")
+        # 1. Resume Upload (Admin uses st.session_state.resumes_to_analyze list)
+        st.markdown("#### 1. Upload Resumes (Saved to DB)")
         resume_upload_type = st.radio("Upload Type", ["Single Resume", "Multiple Resumes"], key="resume_upload_type_admin")
 
         uploaded_files = st.file_uploader(
@@ -751,38 +944,49 @@ def admin_dashboard():
         )
         
         if st.button("Load and Parse Resume(s) for Analysis", key="parse_resumes_admin"):
-            if uploaded_files:
+            if not st.session_state.db.is_connected():
+                st.error("Cannot load resume: Database is not connected.")
+            elif uploaded_files:
                 files_to_process = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
                 count = 0
-                with st.spinner("Parsing and saving resume(s) to database... This may take a moment."):
+                with st.spinner("Parsing resume(s)... This may take a moment."):
                     for file in files_to_process:
                         if file:
+                            # parse_and_store_resume saves to DB if file_name_key='admin_analysis'
                             result = parse_and_store_resume(file, file_name_key='admin_analysis')
                             
-                            if "success" in result:
+                            if "error" not in result:
                                 count += 1
                             else:
-                                st.error(f"Failed to parse and save {file.name}: {result['error']}")
+                                st.error(f"Failed to parse {file.name}: {result['error']}")
 
+                # Refresh list from DB
+                st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
                 if count > 0:
-                    st.success(f"Successfully loaded and saved {count} new resume(s) to the database. The total count is now {len(fetch_all_resumes())}.")
-                    st.rerun() 
-                elif not all_resumes:
-                    st.warning("No resumes were successfully loaded and parsed.")
+                    st.success(f"Successfully loaded and parsed {count} resume(s) for analysis and saved to DB.")
+                elif not st.session_state.resumes_to_analyze:
+                    st.warning("No new resumes were successfully loaded and parsed.")
             else:
                 st.warning("Please upload one or more resume files.")
 
+        st.markdown("#### Resumes Available for Analysis (Loaded from DB):")
+        if st.session_state.resumes_to_analyze:
+             for resume_data in st.session_state.resumes_to_analyze:
+                 status_badge = f"({resume_data.get('status', 'Pending')})"
+                 st.write(f"- **{resume_data['name']}** {status_badge} (ID: {resume_data['_id'][:6]}...)")
+        else:
+             st.info("No resumes available.")
+        
         st.markdown("---")
 
+        # 2. JD Selection and Analysis
         st.markdown("#### 2. Select JD and Run Analysis")
 
-        if not all_resumes:
+        if not st.session_state.resumes_to_analyze:
             st.info("Upload and parse resumes first to enable analysis.")
-            return
 
         if not st.session_state.admin_jd_list:
-            st.error("Please add at least one Job Description in the 'Job Description Management' tab before running an analysis.")
-            return
+            st.error("Please add at least one Job Description in the 'JD Management' tab before running an analysis.")
 
         jd_options = {item['name']: item['content'] for item in st.session_state.admin_jd_list}
         selected_jd_name = st.selectbox("Select JD for Matching", list(jd_options.keys()), key="select_jd_admin")
@@ -790,14 +994,21 @@ def admin_dashboard():
 
 
         if st.button("Run Match Analysis", key="run_match_analysis_admin"):
-            st.session_state.admin_match_results = []
             
+            if not st.session_state.db.is_connected():
+                st.error("Cannot run analysis: Database is not connected.")
+                return
+
             if not selected_jd_content:
                 st.error("Selected JD content is empty.")
                 return
+            
+            if not st.session_state.resumes_to_analyze:
+                st.error("No resumes available to analyze.")
+                return
 
-            with st.spinner(f"Matching {len(all_resumes)} resumes against '{selected_jd_name}'..."):
-                for resume_data in all_resumes:
+            with st.spinner(f"Matching {len(st.session_state.resumes_to_analyze)} resumes against '{selected_jd_name}'..."):
+                for resume_data in st.session_state.resumes_to_analyze:
                     
                     resume_name = resume_data['name']
                     parsed_json = resume_data['parsed']
@@ -805,10 +1016,16 @@ def admin_dashboard():
                     try:
                         fit_output = evaluate_jd_fit(selected_jd_content, parsed_json)
                         
+                        # --- ENHANCED EXTRACTION LOGIC (FIXED) ---
                         overall_score_match = re.search(r'Overall Fit Score:\s*(\d+)\s*/10', fit_output, re.IGNORECASE)
-                        section_analysis_match = re.search(r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', fit_output, re.DOTALL)
+                        section_analysis_match = re.search(
+                             r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', 
+                             fit_output, re.DOTALL
+                        )
 
-                        skills_percent, experience_percent, education_percent = 'N/A', 'N/A', 'N/A'
+                        skills_percent = 'N/A'
+                        experience_percent = 'N/A'
+                        education_percent = 'N/A'
                         
                         if section_analysis_match:
                             section_text = section_analysis_match.group(1)
@@ -821,8 +1038,9 @@ def admin_dashboard():
                             if education_match: education_percent = education_match.group(1)
                         
                         overall_score = overall_score_match.group(1) if overall_score_match else 'N/A'
+                        # --- END ENHANCED EXTRACTION LOGIC (FIXED) ---
 
-                        st.session_state.admin_match_results.append({
+                        result_item = {
                             "resume_name": resume_name,
                             "jd_name": selected_jd_name,
                             "overall_score": overall_score,
@@ -830,9 +1048,12 @@ def admin_dashboard():
                             "experience_percent": experience_percent, 
                             "education_percent": education_percent,   
                             "full_analysis": fit_output
-                        })
+                        }
+                        # Save results to DB
+                        st.session_state.db.save_match_result(result_item, 'admin')
+                        
                     except Exception as e:
-                        st.session_state.admin_match_results.append({
+                        error_item = {
                             "resume_name": resume_name,
                             "jd_name": selected_jd_name,
                             "overall_score": "Error",
@@ -840,173 +1061,361 @@ def admin_dashboard():
                             "experience_percent": "Error", 
                             "education_percent": "Error",   
                             "full_analysis": f"Error running analysis: {e}\n{traceback.format_exc()}"
-                        })
-                st.success("Analysis complete!")
+                        }
+                        st.session_state.db.save_match_result(error_item, 'admin')
+                        
+                # Refresh match results from DB
+                st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
+                st.success("Analysis complete and results saved to DB!")
 
+
+        # 3. Display Results
         if st.session_state.get('admin_match_results'):
-            st.markdown("#### 3. Match Results")
-            results_df = st.session_state.admin_match_results
+            st.markdown("#### 3. Recent Match Results (Loaded from DB)")
             
+            # Filter by selected JD for better focus
+            results_to_display = [r for r in st.session_state.admin_match_results if r['jd_name'] == selected_jd_name]
+            # If no results match the current JD, show all recent results
+            if not results_to_display:
+                results_to_display = st.session_state.admin_match_results
+                st.info(f"Showing all {len(results_to_display)} most recent results as none match the selected JD: {selected_jd_name}")
+
             display_data = []
-            for item in results_df:
-                status = next((r['status'] for r in all_resumes if r['name'] == item["resume_name"]), 'N/A')
-                
+            for item in results_to_display:
                 display_data.append({
                     "Resume": item["resume_name"],
                     "JD": item["jd_name"],
                     "Fit Score (out of 10)": item["overall_score"],
                     "Skills (%)": item.get("skills_percent", "N/A"),
                     "Experience (%)": item.get("experience_percent", "N/A"), 
-                    "Education (%)": item.get("education_percent", "N/A"), 
-                    "Approval Status": status
+                    "Education (%)": item.get("education_percent", "N/A"),
+                    "Time": item.get('created_at_str', 'N/A')
                 })
 
             st.dataframe(display_data, use_container_width=True)
 
+            # Display detailed analysis in expanders
             st.markdown("##### Detailed Reports")
-            for item in results_df:
-                header_text = f"Report for **{item['resume_name']}** against {item['jd_name']} (Score: **{item['overall_score']}/10**)"
+            for item in results_to_display:
+                header_text = f"Report for **{item['resume_name']}** against {item['jd_name']} (Score: **{item['overall_score']}/10** | S: **{item.get('skills_percent', 'N/A')}%** | E: **{item.get('experience_percent', 'N/A')}%** | Edu: **{item.get('education_percent', 'N/A')}%**)"
                 with st.expander(header_text):
                     st.markdown(item['full_analysis'])
 
-    # --- TAB 3: Candidate Approval (Uses DB read/write) ---
-    with tab_candidate:
-        st.subheader("Review and Approve Candidate Resumes (Persistent)")
-        
-        all_resumes = fetch_all_resumes() # Re-fetch to ensure the list is fresh
-        if not all_resumes:
-            st.info("No resumes have been uploaded for analysis yet.")
-            return
+    
+    # --- TAB 3: Candidate Approval (FIXED LOGIC) ---
+    with tab_candidate_approval:
+        st.subheader("Review and Approve Candidate Resumes")
+        st.markdown("Use this list to set the review status for analyzed resumes.")
 
-        st.markdown("### Resume Status List")
+        # CRITICAL: Always re-load resumes when this tab is active or rerun
+        if st.session_state.db.is_connected():
+            st.session_state.resumes_to_analyze = st.session_state.db.get_resumes() 
         
-        for resume_data in all_resumes:
-            
-            resume_mongo_id = resume_data['id']
-            resume_name = resume_data['name']
-            current_status = resume_data.get('status', 'Pending')
-            
-            col1, col2, col3 = st.columns([0.4, 0.4, 0.2])
-            
-            with col1:
-                st.markdown(f"**Resume:** {resume_name}")
-                st.markdown(f"**Current Status:** **{current_status}**")
+        resumes_list = st.session_state.resumes_to_analyze
 
-            with col2:
-                new_status = st.selectbox(
-                    "Set Status",
-                    ["Pending", "Approved", "Rejected"],
-                    index=["Pending", "Approved", "Rejected"].index(current_status),
-                    key=f"candidate_status_select_{resume_mongo_id}"
-                )
-                
-            with col3:
-                if st.button("Update", key=f"candidate_update_btn_{resume_mongo_id}"):
-                    modified = update_resume_status(
-                        resume_mongo_id=resume_mongo_id,
-                        new_status=new_status,
-                        approver_name="Admin User"
+        if not resumes_list:
+            st.info("No resumes have been uploaded and parsed for review yet.")
+        else:
+            st.markdown("#### Resume Status List")
+            
+            # Define status options
+            STATUS_OPTIONS = ["Pending", "Approved", "Rejected", "Contacted"]
+
+            # Function to update the status in MongoDB (defined inside the dashboard scope)
+            def update_resume_status(r_id, status, r_name):
+                # NOTE: ObjectId is available here due to the corrected global import
+                if st.session_state.db.is_connected():
+                    # 1. Update the status in the MongoDB database (THE SAVE OPERATION)
+                    st.session_state.db.db.admin_resumes.update_one(
+                        {'_id': ObjectId(r_id)},
+                        {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
                     )
-                    if modified:
-                        st.success(f"Status for **{resume_name}** updated to **{new_status}**.")
-                        st.rerun() 
-                    else:
-                        st.error(f"Failed to update status for {resume_name}.")
+                    st.toast(f"Status for {r_name} updated to {status}!")
+                    
+                    # 2. <<< CRITICAL FIX: IMMEDIATELY RELOAD THE LIST FROM DB >>>
+                    # This ensures the session state list reflects the database change immediately.
+                    st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
 
-            st.markdown("---") 
+                st.rerun() # Rerun the app to reflect the session state change
 
-    # --- TAB 4: Vendor Approval (Uses DB read/write) ---
-    with tab_vendor:
-        st.subheader("Manage and Approve Service Vendors (Persistent)")
-        
-        # 1. Add New Vendor Form
-        st.markdown("#### 1. Add New Vendor")
-        with st.form("new_vendor_form"):
-            vendor_name = st.text_input("Vendor Name", key="vendor_name_input")
-            vendor_domain = st.text_input("Service Domain (e.g., Training, IT, Logistics)", key="vendor_domain_input")
-            submitted = st.form_submit_button("Add Vendor")
-            
-            if submitted:
-                if vendor_name and vendor_domain:
-                    inserted_id = insert_new_vendor(vendor_name, vendor_domain)
-                    if inserted_id:
-                        st.success(f"Vendor '{vendor_name}' added successfully with status: Pending.")
-                        st.rerun() 
-                else:
-                    st.error("Please fill in both Vendor Name and Service Domain.")
-        
-        st.markdown("---")
-        
-        # 2. Approval List
-        st.markdown("#### 2. Vendor Approval List")
-
-        all_vendors = fetch_all_vendors() # Re-fetch to ensure the list is fresh
-        if not all_vendors:
-            st.info("No vendors have been added yet.")
-            return
-
-        for vendor_data in all_vendors:
-            
-            vendor_mongo_id = vendor_data['id']
-            vendor_name = vendor_data['name']
-            current_status = vendor_data.get('status', 'Pending')
-            vendor_domain = vendor_data['domain']
-
-            col1, col2, col3 = st.columns([0.4, 0.4, 0.2])
-            
-            with col1:
-                st.markdown(f"**Vendor:** {vendor_name}")
-                st.markdown(f"**Domain:** {vendor_domain}")
-                st.markdown(f"**Current Status:** **{current_status}**")
-
-            with col2:
-                new_status = st.selectbox(
-                    "Set Status",
-                    ["Pending", "Approved", "Rejected"],
-                    index=["Pending", "Approved", "Rejected"].index(current_status),
-                    key=f"vendor_status_select_{vendor_mongo_id}"
-                )
+            for resume_data in resumes_list:
+                resume_id = resume_data['_id']
+                current_status = resume_data.get('status', 'Pending') 
+                resume_name = resume_data.get('name', 'N/A')
                 
-            with col3:
-                if st.button("Update", key=f"vendor_update_btn_{vendor_mongo_id}"):
-                    modified = update_vendor_status(vendor_mongo_id, new_status)
-                    if modified:
-                        st.success(f"Status for **{vendor_name}** updated to **{new_status}**.")
-                        st.rerun() 
+                # Layout matching the screenshot
+                col_name, col_status, col_button = st.columns([3, 2, 1])
+
+                with col_name:
+                    st.write(f"**Resume:** {resume_name}")
+                    st.write(f"**Current Status:** {current_status}")
+
+                with col_status:
+                    # Use unique key for each dropdown
+                    new_status = st.selectbox(
+                        "Set Status",
+                        STATUS_OPTIONS,
+                        index=STATUS_OPTIONS.index(current_status) if current_status in STATUS_OPTIONS else 0,
+                        key=f"status_select_{resume_id}",
+                        label_visibility="collapsed" # Hides the label for clean layout
+                    )
+                
+                with col_button:
+                    # Only show the update button if the status has actually changed
+                    if new_status != current_status:
+                        if st.session_state.db.is_connected():
+                            st.button(
+                                "Update",
+                                key=f"update_btn_{resume_id}",
+                                on_click=update_resume_status,
+                                args=(resume_id, new_status, resume_name)
+                            )
+                        else:
+                            st.button("Update", key=f"update_btn_disabled_no_db_{resume_id}", disabled=True, help="DB not connected.")
                     else:
-                        st.error(f"Failed to update status for {vendor_name}.")
+                        # Placeholder to keep alignment consistent
+                        st.button("Update", key=f"update_btn_disabled_{resume_id}", disabled=True)
+                
+                st.markdown("---") # Separator between resumes
 
-            st.markdown("---") 
+    
+    # --- TAB 4: Vendors Approval (NEW FEATURE) ---
+    with tab_vendor_approval:
+        st.subheader("Manage and Approve Vendors/Hiring Companies")
+        st.markdown("Vendors (Hiring Companies) must be approved before they can post jobs.")
+        
+        # Vendor Input Form
+        with st.expander("➕ Manually Add New Vendor"):
+            with st.form("add_vendor_form"):
+                vendor_name = st.text_input("Vendor Company Name", key="vendor_name_input")
+                vendor_contact = st.text_input("Contact Email", key="vendor_contact_input")
+                vendor_industry = st.text_input("Industry/Focus", key="vendor_industry_input")
+                
+                submitted = st.form_submit_button("Submit Vendor for Approval")
+                
+                if submitted:
+                    if not st.session_state.db.is_connected():
+                         st.error("Cannot submit vendor: Database is not connected.")
+                    elif vendor_name and vendor_contact:
+                        vendor_data = {
+                            "name": vendor_name,
+                            "contact_email": vendor_contact,
+                            "industry": vendor_industry,
+                            "status": "Pending", # Initial status
+                        }
+                        st.session_state.db.save_vendor(vendor_data)
+                        # Refresh vendor list after saving
+                        st.session_state.vendor_list = st.session_state.db.get_vendors()
+                        st.success(f"Vendor '{vendor_name}' added successfully and set to Pending.")
+                        st.rerun()
+                    else:
+                        st.error("Vendor Name and Contact Email are required.")
 
-    # --- TAB 5: Dashboard Overview (Statistics) ---
-    with tab_overview:
+        st.markdown("#### Vendor Status List")
+        
+        # Reload vendor list every time the tab is active, but only if connected
+        if st.session_state.db.is_connected():
+            st.session_state.vendor_list = st.session_state.db.get_vendors() 
+        else:
+            st.session_state.vendor_list = [] # Ensure it's empty if connection fails
+            st.warning("Vendor list cannot be loaded: Database is not connected.")
+            
+        vendors_list = st.session_state.vendor_list
+
+        if not vendors_list:
+            st.info("No vendors have been added for review yet.")
+        else:
+            # Define status options for vendors
+            VENDOR_STATUS_OPTIONS = ["Pending", "Approved", "Onboarding", "Rejected"]
+
+            for vendor_data in vendors_list:
+                vendor_id = vendor_data['_id']
+                current_status = vendor_data.get('status', 'Pending') 
+                vendor_name = vendor_data.get('name', 'N/A')
+                
+                # Layout
+                col_name, col_status, col_button = st.columns([3, 2, 1])
+
+                with col_name:
+                    st.write(f"**Vendor:** {vendor_name}")
+                    st.write(f"**Contact:** {vendor_data.get('contact_email', 'N/A')}")
+                    st.write(f"**Current Status:** {current_status}")
+
+                with col_status:
+                    # Use unique key for each dropdown
+                    new_status = st.selectbox(
+                        "Set Status",
+                        VENDOR_STATUS_OPTIONS,
+                        index=VENDOR_STATUS_OPTIONS.index(current_status) if current_status in VENDOR_STATUS_OPTIONS else 0,
+                        key=f"vendor_status_select_{vendor_id}",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_button:
+                    # Function to update the status in MongoDB
+                    def update_vendor_status(v_id, status, v_name):
+                        if st.session_state.db.is_connected():
+                            st.session_state.db.db.vendors.update_one(
+                                {'_id': ObjectId(v_id)},
+                                {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
+                            )
+                            st.toast(f"Status for {v_name} updated to {status}!")
+                            st.session_state.vendor_list = st.session_state.db.get_vendors() # Reload
+                        st.rerun() # Rerun to refresh the list and show the new status
+
+                    # Update button
+                    if new_status != current_status:
+                        if st.session_state.db.is_connected():
+                            st.button(
+                                "Update",
+                                key=f"vendor_update_btn_{vendor_id}",
+                                on_click=update_vendor_status,
+                                args=(vendor_id, new_status, vendor_name)
+                            )
+                        else:
+                            st.button("Update", key=f"vendor_update_btn_disabled_no_db_{vendor_id}", disabled=True, help="DB not connected.")
+                    else:
+                        st.button("Update", key=f"vendor_update_btn_disabled_{vendor_id}", disabled=True)
+                
+                st.markdown("---")
+                
+    # --- TAB 5: Statistics (ADDED LATEST APPLICATIONS) ---
+    with tab_metrics:
         st.subheader("Platform Metrics")
         
-        total_candidates = len(all_resumes)
-        total_jds = len(st.session_state.admin_jd_list)
-        total_vendors = len(all_vendors)
+        if not st.session_state.db.is_connected():
+            st.error("Cannot load metrics: Database is not connected.")
+            metrics = st.session_state.db.get_platform_metrics() # Returns 0s if disconnected
+        else:
+            # Get the metrics
+            metrics = st.session_state.db.get_platform_metrics()
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+        # Display Metrics in columns (cards)
+        col_cands, col_jds, col_vendors, col_apps, col_social = st.columns(5)
         
-        with col1: st.metric(label="Total Candidates (DB)", value=total_candidates)
-        with col2: st.metric(label="Total JDs (Session)", value=total_jds)
-        with col3: st.metric(label="Total Vendors (DB)", value=total_vendors)
-        with col4: st.metric(label="No. of Applications", value=st.session_state.applications_count)
-        with col5: st.metric(label="No. of Social Media Posts", value=st.session_state.social_media_posts)
+        # Helper function for metric display (to keep it DRY)
+        def display_metric(column, title, value):
+            with column:
+                st.markdown(
+                    f"""
+                    <div style='
+                        border: 1px solid #ccc; 
+                        border-radius: 5px; 
+                        padding: 10px; 
+                        text-align: center;
+                        margin-bottom: 10px;
+                        background-color: #f9f9f9;
+                    '>
+                        <p style='font-size: 14px; color: #555; margin-bottom: 0;'>{title}</p>
+                        <h3 style='font-size: 30px; margin-top: 0; color: #007bff;'>{value}</h3>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+
+        display_metric(col_cands, "Total Resumes (Candidates)", metrics["total_candidates"])
+        display_metric(col_jds, "Total JDs (Admin + Candidate)", metrics["total_jds"])
+        display_metric(col_vendors, "Total Vendors", metrics["total_vendors"])
+        display_metric(col_apps, "Total Applications/Matches Run", metrics["no_of_applications"])
+        display_metric(col_social, "No. of Social Media Posts", metrics["no_of_social_media_posts"])
+        
+        st.markdown("---")
+        
+        # --- NEW SECTION: Latest Applications ---
+        st.subheader("Recent Match Results (Latest 10 Applications/Matches)")
+        
+        if st.session_state.db.is_connected():
+            # Get the combined list of latest matches
+            latest_matches = st.session_state.db.get_latest_applications(limit=10)
+            
+            if latest_matches:
+                display_data = []
+                for item in latest_matches:
+                    display_data.append({
+                        "Time": item.get('created_at', 'N/A'),
+                        "Resume": item.get("resume_name", "N/A"),
+                        "JD Matched Against": item.get("jd_name", "N/A"),
+                        "Score": f"{item.get('overall_score', 'N/A')}/10",
+                        "Source": item.get("Source", "N/A"), # Admin for manual runs, Candidate for candidate runs
+                    })
+                
+                # Display the data as a table
+                st.dataframe(display_data, use_container_width=True)
+            else:
+                st.info("No applications or match analyses have been run yet.")
+        else:
+            st.warning("Database is disconnected. Cannot fetch latest application data.")
             
         st.markdown("---")
-        st.subheader("Update Counter Simulation")
+        st.info("Note: 'Total Resumes' counts unique resumes uploaded by Admin for analysis. 'Total JDs' aggregates JDs added by both Admin and Candidates.")
+
+
+    # --- TAB 6: Settings ---
+    with tab_settings:
+        st.subheader("Database Settings")
+        st.warning("Use these options with caution, as they affect persistent data.")
         
-        with st.form("counter_update_form"):
-            app_change = st.number_input("Change Applications Counter By", min_value=-st.session_state.applications_count, value=0, step=1, key="app_change")
-            post_change = st.number_input("Change Social Media Posts Counter By", value=0, step=1, key="post_change")
+        st.markdown("#### Manually Update Social Media Counter")
+        
+        if 'social_media_posts_change' not in st.session_state:
+            st.session_state.social_media_posts_change = 0
             
-            if st.form_submit_button("Update Counters"):
-                st.session_state.applications_count = max(0, st.session_state.applications_count + app_change)
-                st.session_state.social_media_posts = max(0, st.session_state.social_media_posts + post_change)
-                st.success("Counters updated! Refreshing Dashboard...")
+        # Create a number input widget (resembling the image)
+        st.markdown("Change Social Media Posts Counter By")
+        change_by = st.number_input(
+            "Change Social Media Posts Counter By", 
+            min_value=-999999, 
+            value=st.session_state.social_media_posts_change, 
+            step=1,
+            label_visibility="collapsed"
+        )
+        st.session_state.social_media_posts_change = change_by # Keep the state updated
+        
+        def handle_social_media_update():
+            if not st.session_state.db.is_connected():
+                st.error("Cannot update counter: Database is not connected.")
+                return
+            
+            # The change_by is stored in session_state when the number_input changes
+            change = st.session_state.social_media_posts_change 
+            
+            if change != 0:
+                new_count = st.session_state.db.update_social_media_posts_count(change)
+                st.success(f"Social Media Posts counter updated by {change}. New count: {new_count}")
+                # Reset the input field to 0 after update
+                st.session_state.social_media_posts_change = 0 
+            else:
+                st.info("No change specified (Value is 0).")
+            st.rerun() # Rerun to refresh the statistics display
+
+        # Button matching the image
+        if st.button("Update Counters", on_click=handle_social_media_update):
+            pass # The action is handled by the on_click callback
+
+        st.markdown("---")
+        
+        if st.button("🔄 Reload All Data from MongoDB", key="reload_db_admin"):
+            if st.session_state.db.is_connected():
+                st.session_state.admin_jd_list = st.session_state.db.get_jds('admin')
+                st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
+                st.session_state.vendor_list = st.session_state.db.get_vendors()
+                st.session_state.admin_match_results = st.session_state.db.get_match_results('admin')
+                st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
+                st.session_state.candidate_match_results = st.session_state.db.get_match_results('candidate')
+                st.success("All data reloaded from MongoDB.")
                 st.rerun()
-                
+            else:
+                st.error("Cannot reload: Database is not connected.")
+
+        st.markdown("---")
+        if st.button("🚨 Clear ALL Application Data from MongoDB 🚨", key="clear_db_admin"):
+            if st.session_state.db and st.session_state.db.is_connected():
+                st.session_state.db.clear_all_data()
+                st.success("All application data cleared from MongoDB and session state reset.")
+                st.rerun()
+            else:
+                st.error("Database is not connected.")
+
 
 def candidate_dashboard():
     st.header("👩‍🎓 Candidate Dashboard")
@@ -1014,6 +1423,21 @@ def candidate_dashboard():
 
     st.sidebar.button("⬅️ Go Back to Role Selection", on_click=go_to, args=("role_selection",))
     
+    # Check DB connection status
+    if 'db' not in st.session_state or not st.session_state.db.is_connected():
+        st.error("🚨 Cannot proceed: MongoDB database is not connected. Please check your MONGODB_URI or contact support.")
+        # FIX: Initialize lists to empty if DB is not connected
+        st.session_state.candidate_jd_list = []
+        st.session_state.candidate_match_results = []
+    
+    # Initialize candidate JD and results lists from DB
+    if st.session_state.db.is_connected():
+        if "candidate_jd_list" not in st.session_state:
+            st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
+        if "candidate_match_results" not in st.session_state:
+            st.session_state.candidate_match_results = st.session_state.db.get_match_results('candidate')
+
+    # Sidebar for Resume Upload (Centralized Upload)
     with st.sidebar:
         st.header("Upload Your Resume")
         uploaded_file = st.file_uploader("Choose a PDF or DOCX file", type=["pdf", "docx"])
@@ -1025,7 +1449,7 @@ def candidate_dashboard():
                 if "error" not in result:
                     st.session_state.parsed = result['parsed']
                     st.session_state.full_text = result['full_text']
-                    st.session_state.excel_data = result.get('excel_data')
+                    st.session_state.excel_data = result['excel_data'] 
                     st.success("Resume parsed successfully!")
                 else:
                     st.error(f"Parsing failed: {result['error']}")
@@ -1039,178 +1463,246 @@ def candidate_dashboard():
         else:
             st.info("Please upload a resume to begin.")
 
+    # Main Content Tabs 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📄 Resume Parsing", 
         "💬 Resume Chatbot (Q&A)", 
         "❓ Interview Prep", 
         "📚 JD Management", 
-        "🎯 Batch JD Match"
+        "🎯 Batch JD Match"  
     ])
     
+    # --- TAB 1: Resume Parsing ---
     with tab1:
-        st.header("Resume Parsing")
-        if not st.session_state.full_text:
-            st.warning("Please upload and parse a resume in the sidebar first.")
-            return
+         st.header("Resume Parsing")
+         if not st.session_state.full_text:
+             st.warning("Please upload and parse a resume in the sidebar first.")
+         else:
+             parsed = st.session_state.parsed
+             full_text = st.session_state.full_text
 
-        col1, col2 = st.columns(2)
-        with col1: output_format = st.radio('Output Format', ['json', 'markdown'], key='format_radio_c')
-        with col2: section = st.selectbox('Select Section to View', section_options, key='section_select_c')
+             if "error" in parsed:
+                 st.error(parsed.get("error", "An unknown error occurred during parsing."))
+             else:
+                 col1, col2 = st.columns(2)
+                 with col1:
+                     output_format = st.radio('Output Format', ['json', 'markdown'], key='format_radio_c')
+                 with col2:
+                     section = st.selectbox('Select Section to View', section_options, key='section_select_c')
 
-        parsed = st.session_state.parsed
-        full_text = st.session_state.full_text
+                 if output_format == 'json':
+                     output_str = json.dumps(parsed, indent=2)
+                     st.text_area("Parsed Output (JSON)", output_str, height=350)
+                 else:
+                     output_str = parse_with_llm(full_text, return_type='markdown')
+                     st.markdown("### Parsed Output (Markdown)")
+                     st.markdown(output_str)
+         
+                 if st.session_state.excel_data:
+                     st.download_button(
+                         label="Download Parsed Data (Excel)",
+                         data=st.session_state.excel_data,
+                         file_name=f"{parsed.get('name', 'candidate').replace(' ', '_')}_parsed_data.xlsx",
+                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                     )
+                 
+                 section_content_str = ""
+                 if section == "full resume":
+                     section_content_str = full_text
+                 elif section in parsed:
+                     section_val = parsed[section]
+                     section_content_str = json.dumps(section_val, indent=2) if isinstance(section_val, (list, dict)) else str(section_val)
+                 else:
+                     section_content_str = f"Section '{section}' not found or is empty."
 
-        if "error" in parsed:
-            st.error(parsed.get("error", "An unknown error occurred during parsing."))
-            return
+                 st.text_area("Selected Section Content", section_content_str, height=200)
 
-        if output_format == 'json':
-            output_str = json.dumps(parsed, indent=2)
-            st.text_area("Parsed Output (JSON)", output_str, height=350)
-        else:
-            output_str = parse_with_llm(full_text, return_type='markdown')
-            st.markdown("### Parsed Output (Markdown)")
-            st.markdown(output_str)
-
-        if st.session_state.excel_data:
-            st.download_button(
-                label="Download Parsed Data (Excel)",
-                data=st.session_state.excel_data,
-                file_name=f"{parsed.get('name', 'candidate').replace(' ', '_')}_parsed_data.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        
-        section_content_str = ""
-        if section == "full resume": section_content_str = full_text
-        elif section in parsed:
-            section_val = parsed[section]
-            section_content_str = json.dumps(section_val, indent=2) if isinstance(section_val, (list, dict)) else str(section_val)
-        else: section_content_str = f"Section '{section}' not found or is empty."
-
-        st.text_area("Selected Section Content", section_content_str, height=200)
-
+    # --- TAB 2: Resume Chatbot (Q&A) ---
     with tab2:
-        st.header("Resume Chatbot (Q&A)")
-        st.markdown("### Ask any question about the uploaded resume.")
-        if not st.session_state.full_text:
-            st.warning("Please upload and parse a resume first.")
-            return
-
-        question = st.text_input("Your Question", placeholder="e.g., What are the candidate's key skills?")
-        
-        if st.button("Get Answer", key="qa_btn"):
-            with st.spinner("Generating answer..."):
-                try:
-                    answer = qa_on_resume(question)
-                    st.session_state.qa_answer = answer
-                except Exception as e:
-                    st.error(f"Error during Q&A: {e}")
-                    st.session_state.qa_answer = "Could not generate an answer."
-
-        if st.session_state.get('qa_answer'):
-            st.text_area("Answer", st.session_state.qa_answer, height=150)
-
-    with tab3:
-        st.header("Interview Preparation Tools")
-        if not st.session_state.parsed or "error" in st.session_state.parsed:
-            st.warning("Please upload and successfully parse a resume first.")
-            return
-
-        st.subheader("Generate Interview Questions")
-        section_choice = st.selectbox("Select Section", question_section_options, key='iq_section_c')
-        
-        if st.button("Generate Interview Questions", key='iq_btn_c'):
-            with st.spinner("Generating questions..."):
-                try:
-                    raw_questions_response = generate_interview_questions(st.session_state.parsed, section_choice)
-                    st.session_state.iq_output = raw_questions_response
-                except Exception as e:
-                    st.error(f"Error generating questions: {e}")
-                    st.session_state.iq_output = "Error generating questions."
-
-        if st.session_state.get('iq_output'):
-            st.text_area("Generated Interview Questions (by difficulty level)", st.session_state.iq_output, height=400)
+         st.header("Resume Chatbot (Q&A)")
+         st.markdown("### Ask any question about the uploaded resume.")
+         if not st.session_state.full_text:
+             st.warning("Please upload and parse a resume first.")
+         else:
+             question = st.text_input("Your Question", placeholder="e.g., What are the candidate's key skills?")
             
+             if st.button("Get Answer", key="qa_btn"):
+                 with st.spinner("Generating answer..."):
+                     try:
+                         answer = qa_on_resume(question)
+                         st.session_state.qa_answer = answer
+                     except Exception as e:
+                         st.error(f"Error during Q&A: {e}")
+                         st.session_state.qa_answer = "Could not generate an answer."
+
+             if st.session_state.get('qa_answer'):
+                 st.text_area("Answer", st.session_state.qa_answer, height=150)
+             
+    # --- TAB 3: Interview Prep ---
+    with tab3:
+         st.header("Interview Preparation Tools")
+         if not st.session_state.parsed or "error" in st.session_state.parsed:
+             st.warning("Please upload and successfully parse a resume first.")
+         
+         else:
+             st.subheader("Generate Interview Questions")
+             section_choice = st.selectbox("Select Section", question_section_options, key='iq_section_c')
+            
+             if st.button("Generate Interview Questions", key='iq_btn_c'):
+                 with st.spinner("Generating questions..."):
+                     try:
+                         raw_questions_response = generate_interview_questions(st.session_state.parsed, section_choice)
+                         st.session_state.iq_output = raw_questions_response
+                     except Exception as e:
+                         st.error(f"Error generating questions: {e}")
+                         st.session_state.iq_output = "Error generating questions."
+
+             if st.session_state.get('iq_output'):
+                 st.text_area("Generated Interview Questions (by difficulty level)", st.session_state.iq_output, height=400)
+             
+    # --- TAB 4: JD Management ---
     with tab4:
         st.header("📚 Manage Job Descriptions for Matching")
-        if "candidate_jd_list" not in st.session_state: st.session_state.candidate_jd_list = []
+        st.markdown("JDs added here are saved for your batch matching.")
         
         jd_type = st.radio("Select JD Type", ["Single JD", "Multiple JD"], key="jd_type_candidate")
         st.markdown("### Add JD by:")
         
         method = st.radio("Choose Method", ["Upload File", "Paste Text", "LinkedIn URL"], key="jd_add_method_candidate") 
 
+        # URL
         if method == "LinkedIn URL":
-            url_list = st.text_area("Enter one or more URLs (comma separated)" if jd_type == "Multiple JD" else "Enter URL", key="url_list_candidate")
+            url_list = st.text_area(
+                "Enter one or more URLs (comma separated)" if jd_type == "Multiple JD" else "Enter URL", key="url_list_candidate"
+            )
             if st.button("Add JD(s) from URL", key="add_jd_url_btn_candidate"):
-                if url_list:
+                if st.session_state.db.is_connected() and url_list:
                     urls = [u.strip() for u in url_list.split(",")] if jd_type == "Multiple JD" else [url_list.strip()]
+                    
                     count = 0
                     for url in urls:
                         if not url: continue
-                        with st.spinner(f"Attempting JD extraction for: {url}"): jd_text = extract_jd_from_linkedin_url(url)
+                        
+                        with st.spinner(f"Attempting JD extraction for: {url}"):
+                            jd_text = extract_jd_from_linkedin_url(url)
+                        
                         name_base = url.split('/jobs/view/')[-1].split('/')[0] if '/jobs/view/' in url else f"URL {count+1}"
-                        st.session_state.candidate_jd_list.append({"name": f"JD from URL: {name_base}", "content": jd_text})
-                        if not jd_text.startswith("[Error"): count += 1
-                    if count > 0: st.success(f"✅ {count} JD(s) added successfully!")
-                    else: st.error("No JDs were added successfully.")
+                        if not jd_text.startswith("[Error"):
+                            # Save to DB
+                            jd_data = {"name": f"JD from URL: {name_base}", "content": jd_text, "source": "url"}
+                            st.session_state.db.save_jd(jd_data, 'candidate')
+                            count += 1
+                            
+                    # Refresh list from DB
+                    st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
+                    if count > 0:
+                        st.success(f"✅ {count} JD(s) added successfully!")
+                    else:
+                        st.error("No JDs were added successfully.")
+                elif not st.session_state.db.is_connected():
+                    st.error("Cannot add JD: Database is not connected.")
 
+
+        # Paste Text
         elif method == "Paste Text":
-            text_list = st.text_area("Paste one or more JD texts (separate by '---')" if jd_type == "Multiple JD" else "Paste JD text here", key="text_list_candidate")
+            text_list = st.text_area(
+                "Paste one or more JD texts (separate by '---')" if jd_type == "Multiple JD" else "Paste JD text here", key="text_list_candidate"
+            )
             if st.button("Add JD(s) from Text", key="add_jd_text_btn_candidate"):
-                if text_list:
+                if st.session_state.db.is_connected() and text_list:
                     texts = [t.strip() for t in text_list.split("---")] if jd_type == "Multiple JD" else [text_list.strip()]
                     for i, text in enumerate(texts):
                          if text:
                             name_base = text.splitlines()[0].strip()
                             if len(name_base) > 30: name_base = f"{name_base[:27]}..."
                             if not name_base: name_base = f"Pasted JD {len(st.session_state.candidate_jd_list) + i + 1}"
-                            st.session_state.candidate_jd_list.append({"name": name_base, "content": text})
+                            
+                            # Save to DB
+                            jd_data = {"name": name_base, "content": text, "source": "pasted"}
+                            st.session_state.db.save_jd(jd_data, 'candidate')
+
+                    # Refresh list from DB
+                    st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
                     st.success(f"✅ {len(texts)} JD(s) added successfully!")
+                elif not st.session_state.db.is_connected():
+                    st.error("Cannot add JD: Database is not connected.")
 
+
+        # Upload File
         elif method == "Upload File":
-            uploaded_files = st.file_uploader("Upload JD file(s)", type=["pdf", "txt", "docx"], accept_multiple_files=True if jd_type == "Multiple JD" else False, key="jd_file_uploader_candidate")
+            uploaded_files = st.file_uploader(
+                "Upload JD file(s)",
+                type=["pdf", "txt", "docx"],
+                accept_multiple_files=True if jd_type == "Multiple JD" else False,
+                key="jd_file_uploader_candidate"
+            )
             if st.button("Add JD(s) from File", key="add_jd_file_btn_candidate"):
-                files_to_process = uploaded_files if jd_type == "Multiple JD" and uploaded_files else [uploaded_files]
-                count = 0
-                for file in files_to_process:
-                    if file:
-                        temp_dir = tempfile.mkdtemp()
-                        temp_path = os.path.join(temp_dir, file.name)
-                        with open(temp_path, "wb") as f: f.write(file.getbuffer())
-                        file_type = get_file_type(temp_path)
-                        jd_text = extract_content(file_type, temp_path)
-                        if not jd_text.startswith("Error"):
-                            st.session_state.candidate_jd_list.append({"name": file.name, "content": jd_text})
-                            count += 1
-                if count > 0: st.success(f"✅ {count} JD(s) added successfully!")
-                else: st.error("No valid JD files were uploaded or content extraction failed.")
+                if st.session_state.db.is_connected():
+                    files_to_process = uploaded_files if jd_type == "Multiple JD" and uploaded_files else [uploaded_files]
+                    count = 0
+                    for file in files_to_process:
+                        if file:
+                            temp_dir = tempfile.mkdtemp()
+                            temp_path = os.path.join(temp_dir, file.name)
+                            with open(temp_path, "wb") as f:
+                                f.write(file.getbuffer())
+                                
+                            file_type = get_file_type(temp_path)
+                            jd_text = extract_content(file_type, temp_path)
+                            
+                            if not jd_text.startswith("Error"):
+                                # Save to DB
+                                jd_data = {"name": file.name, "content": jd_text, "source": "file"}
+                                st.session_state.db.save_jd(jd_data, 'candidate')
+                                count += 1
 
+                    # Refresh list from DB
+                    st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
+                    if count > 0:
+                        st.success(f"✅ {count} JD(s) added successfully!")
+                    else:
+                        st.error("No valid JD files were uploaded or content extraction failed.")
+                elif not st.session_state.db.is_connected():
+                    st.error("Cannot add JD: Database is not connected.")
+
+        # Display Added JDs
         if st.session_state.candidate_jd_list:
-            st.markdown("### ✅ Current JDs Added:")
+            st.markdown("### ✅ Current JDs Added (Persistent in DB):")
             for idx, jd_item in enumerate(st.session_state.candidate_jd_list, 1):
                 title = jd_item['name']
                 display_title = title.replace("--- Simulated JD for: ", "")
-                with st.expander(f"JD {idx}: {display_title}"): st.text(jd_item['content'])
-        else: st.info("No Job Descriptions added yet.")
+                col_disp, col_del = st.columns([10, 1])
+                with col_disp:
+                    with st.expander(f"JD {idx}: {display_title} (Added: {jd_item.get('created_at', 'N/A').strftime('%Y-%m-%d')})"):
+                        st.text(jd_item['content'])
+                with col_del:
+                    if st.button("🗑️", key=f"del_jd_candidate_{jd_item['_id']}"):
+                        if st.session_state.db.is_connected():
+                            st.session_state.db.db.candidate_jds.delete_one({'_id': ObjectId(jd_item['_id'])})
+                            st.session_state.candidate_jd_list = st.session_state.db.get_jds('candidate')
+                            st.rerun()
+                        else:
+                            st.error("Cannot delete: Database is not connected.")
+        else:
+            st.info("No Job Descriptions added yet.")
 
+
+    # --- TAB 5: Batch JD Match ---
     with tab5:
-        st.header("🎯 Batch JD Match")
+        st.header("🎯 Batch JD Match (Results saved to DB)")
         st.markdown("Compare your current resume against all saved job descriptions.")
 
         if not st.session_state.parsed:
             st.warning("Please **upload and parse your resume** in the sidebar first.")
-            return
-
-        if not st.session_state.candidate_jd_list:
+        elif not st.session_state.candidate_jd_list:
             st.error("Please **add Job Descriptions** in the 'JD Management' tab (Tab 4) before running batch analysis.")
-            return
             
-        if "candidate_match_results" not in st.session_state: st.session_state.candidate_match_results = []
+        elif st.button(f"Run Batch Match Against {len(st.session_state.candidate_jd_list)} JDs"):
+            
+            if not st.session_state.db.is_connected():
+                st.error("Cannot run analysis: Database is not connected.")
+                return
 
-        if st.button(f"Run Batch Match Against {len(st.session_state.candidate_jd_list)} JDs"):
-            st.session_state.candidate_match_results = []
-            
             resume_name = st.session_state.parsed.get('name', 'Uploaded Resume')
             parsed_json = st.session_state.parsed
 
@@ -1223,13 +1715,20 @@ def candidate_dashboard():
                     try:
                         fit_output = evaluate_jd_fit(jd_content, parsed_json)
                         
+                        # --- ENHANCED EXTRACTION LOGIC (FIXED) ---
                         overall_score_match = re.search(r'Overall Fit Score:\s*(\d+)\s*/10', fit_output, re.IGNORECASE)
-                        section_analysis_match = re.search(r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', fit_output, re.DOTALL)
+                        section_analysis_match = re.search(
+                             r'--- Section Match Analysis ---\s*(.*?)\s*Strengths/Matches:', 
+                             fit_output, re.DOTALL
+                        )
 
-                        skills_percent, experience_percent, education_percent = 'N/A', 'N/A', 'N/A'
+                        skills_percent = 'N/A'
+                        experience_percent = 'N/A'
+                        education_percent = 'N/A'
                         
                         if section_analysis_match:
                             section_text = section_analysis_match.group(1)
+                            
                             skills_match = re.search(r'Skills Match:\s*(\d+)%', section_text, re.IGNORECASE)
                             experience_match = re.search(r'Experience Match:\s*(\d+)%', section_text, re.IGNORECASE)
                             education_match = re.search(r'Education Match:\s*(\d+)%', section_text, re.IGNORECASE)
@@ -1239,30 +1738,44 @@ def candidate_dashboard():
                             if education_match: education_percent = education_match.group(1)
                         
                         overall_score = overall_score_match.group(1) if overall_score_match else 'N/A'
+                        # --- END ENHANCED EXTRACTION LOGIC (FIXED) ---
 
-                        st.session_state.candidate_match_results.append({
+                        result_item = {
                             "jd_name": jd_name,
                             "overall_score": overall_score,
                             "skills_percent": skills_percent,
                             "experience_percent": experience_percent, 
                             "education_percent": education_percent,   
-                            "full_analysis": fit_output
-                        })
+                            "full_analysis": fit_output,
+                            "resume_name": resume_name, 
+                        }
+                        
+                        # Save results to DB
+                        st.session_state.db.save_match_result(result_item, 'candidate')
+                        
                     except Exception as e:
-                        st.session_state.candidate_match_results.append({
+                        error_item = {
                             "jd_name": jd_name,
                             "overall_score": "Error",
                             "skills_percent": "Error",
                             "experience_percent": "Error", 
-                            "education_percent": "Error",   
-                            "full_analysis": f"Error running analysis for {jd_name}: {e}\n{traceback.format_exc()}"
-                        })
-                st.success("Batch analysis complete!")
+                            "education_percent": "Error", 
+                            "full_analysis": f"Error running analysis for {jd_name}: {e}\n{traceback.format_exc()}",
+                            "resume_name": resume_name
+                        }
+                        st.session_state.db.save_match_result(error_item, 'candidate')
+                
+                # Refresh match results from DB
+                st.session_state.candidate_match_results = st.session_state.db.get_match_results('candidate')
+                st.success("Batch analysis complete and results saved to DB!")
 
+
+        # 3. Display Results
         if st.session_state.get('candidate_match_results'):
-            st.markdown("#### Match Results for Your Resume")
+            st.markdown("#### Recent Match Results for Your Resume (Loaded from DB)")
             results_df = st.session_state.candidate_match_results
             
+            # Create a simple table/summary of results
             display_data = []
             for item in results_df:
                 display_data.append({
@@ -1271,14 +1784,17 @@ def candidate_dashboard():
                     "Skills (%)": item.get("skills_percent", "N/A"),
                     "Experience (%)": item.get("experience_percent", "N/A"), 
                     "Education (%)": item.get("education_percent", "N/A"),   
+                    "Time": item.get('created_at_str', 'N/A')
                 })
 
             st.dataframe(display_data, use_container_width=True)
 
+            # Display detailed analysis in expanders
             st.markdown("##### Detailed Reports")
             for item in results_df:
-                header_text = f"Report for **{item['jd_name'].replace('--- Simulated JD for: ', '')}** (Score: **{item['overall_score']}/10**)"
-                with st.expander(header_text): st.markdown(item['full_analysis'])
+                header_text = f"Report for **{item['jd_name'].replace('--- Simulated JD for: ', '')}** (Score: **{item['overall_score']}/10** | S: **{item.get('skills_percent', 'N/A')}%** | E: **{item.get('experience_percent', 'N/A')}%** | Edu: **{item.get('education_percent', 'N/A')}%**) @ {item.get('created_at_str', 'N/A')}"
+                with st.expander(header_text):
+                    st.markdown(item['full_analysis'])
 
 
 def hiring_dashboard():
@@ -1292,8 +1808,15 @@ def hiring_dashboard():
 def main():
     st.set_page_config(layout="wide", page_title="PragyanAI Job Portal")
 
-    if 'page' not in st.session_state: st.session_state.page = "login"
-    
+    # --- Session State Initialization ---
+    if 'page' not in st.session_state:
+        st.session_state.page = "login"
+        
+    # NEW: Initialize Database Connection
+    # This must run before any dashboard attempts to access st.session_state.db
+    if 'db' not in st.session_state:
+        st.session_state.db = DatabaseManager(MONGODB_URI)
+            
     # Initialize session state for AI features
     if 'parsed' not in st.session_state:
         st.session_state.parsed = {}
@@ -1302,17 +1825,14 @@ def main():
         st.session_state.qa_answer = ""
         st.session_state.iq_output = ""
         st.session_state.jd_fit_output = ""
+        st.session_state.social_media_posts_change = 0 # Social media counter input state
         
-        # Admin Dashboard session-only lists
-        st.session_state.admin_jd_list = [] 
-        st.session_state.admin_match_results = [] 
-        
-        # Initialize counters based on DB fetch
-        all_resumes = fetch_all_resumes() 
-        st.session_state.applications_count = len(all_resumes)
-        st.session_state.social_media_posts = 0 
-        
-        # Candidate Dashboard specific lists
+        # Reset lists if a hard restart occurs, lists will be loaded from DB in respective dashboards
+        # They are initialized here but populated inside the dashboards to ensure they are fresh
+        st.session_state.admin_jd_list = []
+        st.session_state.resumes_to_analyze = []
+        st.session_state.vendor_list = [] 
+        st.session_state.admin_match_results = []
         st.session_state.candidate_jd_list = []
         st.session_state.candidate_match_results = []
 
