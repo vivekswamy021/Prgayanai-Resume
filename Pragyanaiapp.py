@@ -10,7 +10,8 @@ import traceback
 import re
 from dotenv import load_dotenv 
 from pymongo import MongoClient
-from bson.objectid import ObjectId
+from pymongo.errors import ConfigurationError, ConnectionError as PyMongoConnectionError
+from bson.objectobjectid import ObjectId
 from datetime import datetime
 
 # -------------------------
@@ -467,6 +468,7 @@ def parse_with_llm(text, return_type='json'):
                     for sub_k, sub_v in v.items():
                         if sub_v:
                             md += f"  - {sub_k.replace('_', ' ').title()}: {sub_v}\n"
+                    
                 else:
                     md += f"  {v}\n"
                 md += "\n"
@@ -1105,7 +1107,7 @@ def admin_dashboard():
         st.subheader("Review and Approve Candidate Resumes")
         st.markdown("Use this list to set the review status for analyzed resumes.")
 
-        # CRITICAL FIX: Always re-load resumes when this tab is active or rerun
+        # CRITICAL: Always re-load resumes when this tab is active or rerun
         if st.session_state.db.is_connected():
             st.session_state.resumes_to_analyze = st.session_state.db.get_resumes() 
         
@@ -1122,7 +1124,7 @@ def admin_dashboard():
             # Function to update the status in MongoDB (defined inside the dashboard scope)
             def update_resume_status(r_id, status, r_name):
                 if st.session_state.db.is_connected():
-                    # 1. Update the status in the MongoDB database
+                    # 1. Update the status in the MongoDB database (THE SAVE OPERATION)
                     st.session_state.db.db.admin_resumes.update_one(
                         {'_id': ObjectId(r_id)},
                         {'$set': {'status': status, 'status_updated_at': datetime.utcnow()}}
@@ -1130,6 +1132,7 @@ def admin_dashboard():
                     st.toast(f"Status for {r_name} updated to {status}!")
                     
                     # 2. <<< CRITICAL FIX: IMMEDIATELY RELOAD THE LIST FROM DB >>>
+                    # This ensures the session state list reflects the database change immediately.
                     st.session_state.resumes_to_analyze = st.session_state.db.get_resumes()
 
                 st.rerun() # Rerun the app to reflect the session state change
