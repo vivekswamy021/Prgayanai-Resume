@@ -5,17 +5,50 @@ import traceback
 import tempfile
 from datetime import date 
 
-# Import necessary functions/variables from the main app file
-# NOTE: In a real environment, these would come from a 'utils.py' or 'api.py'
-from app import go_to, clear_interview_state, parse_and_store_resume, qa_on_resume, generate_interview_questions, evaluate_interview_answers, evaluate_jd_fit, extract_jd_metadata, extract_jd_from_linkedin_url, DEFAULT_JOB_TYPES, DEFAULT_ROLES
-from app import client, GROQ_MODEL, GROQ_API_KEY # Import Groq client and key for the new JD Chatbot function
+# =========================================================================
+# NOTE: YOU MUST ENSURE THESE FUNCTIONS AND VARIABLES ARE CORRECTLY DEFINED
+# AND IMPORTED FROM YOUR main application file (e.g., app.py).
+# Failure to define these will result in the ModuleNotFoundError you saw.
+# =========================================================================
 
-# --- NEW JD Chatbot Function (Must be defined here or imported from app.py) ---
+try:
+    # Attempt to import all necessary functions and clients from the main app file
+    from app import (
+        go_to, 
+        clear_interview_state, 
+        parse_and_store_resume, 
+        qa_on_resume, 
+        generate_interview_questions, 
+        evaluate_interview_answers, 
+        evaluate_jd_fit, 
+        extract_jd_metadata, 
+        extract_jd_from_linkedin_url, 
+        DEFAULT_JOB_TYPES, 
+        DEFAULT_ROLES
+    )
+    # Ensure the Groq/LLM client and config are imported for the new JD Chatbot
+    from app import client, GROQ_MODEL, GROQ_API_KEY 
+except ImportError as e:
+    st.error(f"FATAL ERROR: Could not import necessary components from 'app.py'. Please ensure 'app.py' exists and defines all required functions/variables. Error: {e}")
+    # Define placeholder functions/variables to prevent immediate crash if app.py is missing/empty
+    go_to = lambda x: st.warning("Navigation function 'go_to' not imported.")
+    clear_interview_state = lambda: st.session_state.update(interview_qa=[], evaluation_report="")
+    DEFAULT_JOB_TYPES = ["Full-time", "Part-time", "Contract"]
+    DEFAULT_ROLES = ["Software Engineer", "Data Analyst", "Project Manager"]
+    # Placeholder for LLM client if import fails
+    client = None 
+    GROQ_MODEL = "mixtral-8x7b-32768"
+    GROQ_API_KEY = None
+
+
+# --- NEW JD Chatbot Function (Relies on client and keys from app.py) ---
 
 def jd_qa_on_jd(question, jd_content):
     """Chatbot for Job Description (Q&A) using LLM."""
-    if not GROQ_API_KEY:
-        return "AI Chatbot Disabled: GROQ_API_KEY not set."
+    global client
+    
+    if not GROQ_API_KEY or not client:
+        return "AI Chatbot Disabled: GROQ_API_KEY is not set or LLM client not initialized."
         
     prompt = f"""Given the following Job Description (JD):
     JD Content: {jd_content}
@@ -33,9 +66,9 @@ def jd_qa_on_jd(question, jd_content):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"Error communicating with LLM API: {e}"
+        return f"Error communicating with LLM API: {e}. Check GROQ_API_KEY and network connection."
 
-# --- Candidate Helper Functions (Same as before) ---
+# --- Candidate Helper Functions ---
 
 def generate_cv_html(parsed_data):
     """Generates a simple, print-friendly HTML string from parsed data for PDF conversion."""
@@ -115,6 +148,7 @@ def cv_management_tab_content():
     }
     
     if "cv_form_data" not in st.session_state:
+        # Load existing parsed data if available
         if st.session_state.get('parsed', {}).get('name'):
             st.session_state.cv_form_data = st.session_state.parsed.copy()
         else:
@@ -184,6 +218,7 @@ def cv_management_tab_content():
         st.session_state.parsed = st.session_state.cv_form_data.copy()
         st.session_state.parsed['name'] = st.session_state.cv_form_data['name']
         
+        # Compile a raw text version for utility and parsing functions
         compiled_text = ""
         for k, v in st.session_state.cv_form_data.items():
             if v:
@@ -276,7 +311,7 @@ def filter_jd_tab_content():
     st.header("🔍 Filter Job Descriptions by Criteria")
     st.markdown("Use the filters below to narrow down your saved Job Descriptions.")
 
-    if not st.session_state.candidate_jd_list:
+    if not st.session_state.get('candidate_jd_list'):
         st.info("No Job Descriptions are currently loaded. Please add JDs in the 'JD Management' tab (Tab 4).")
         if 'filtered_jds_display' not in st.session_state: st.session_state.filtered_jds_display = []
         return
@@ -386,9 +421,9 @@ def filter_jd_tab_content():
                 st.markdown(f"**Extracted Skills:** {', '.join(jd.get('key_skills', ['N/A']))}")
                 st.markdown("---")
                 st.text(jd['content'])
-    elif st.session_state.candidate_jd_list and apply_filters_button:
+    elif st.session_state.get('candidate_jd_list') and apply_filters_button:
         st.info("No Job Descriptions match the selected criteria. Try broadening your filter selections.")
-    elif st.session_state.candidate_jd_list and not apply_filters_button:
+    elif st.session_state.get('candidate_jd_list') and not apply_filters_button:
         st.info("Use the filters above and click **'Apply Filters'** to view matching Job Descriptions.")
 
 
@@ -399,7 +434,7 @@ def resume_chatbot_content(is_resume_parsed):
     st.markdown("### Ask any question about the currently loaded resume.")
     if not is_resume_parsed:
         st.warning("Please upload and parse a resume in the 'Resume Parsing' tab first.")
-    elif "error" in st.session_state.parsed:
+    elif "error" in st.session_state.get('parsed', {}):
          st.error("Cannot use Resume Chatbot: Resume data has parsing errors.")
     else:
         if 'qa_answer' not in st.session_state: st.session_state.qa_answer = ""
@@ -411,6 +446,9 @@ def resume_chatbot_content(is_resume_parsed):
                 try:
                     answer = qa_on_resume(question)
                     st.session_state.qa_answer = answer
+                except NameError:
+                    st.error("Function 'qa_on_resume' not imported from 'app.py'. Check your setup.")
+                    st.session_state.qa_answer = "Could not generate an answer (Function Missing)."
                 except Exception as e:
                     st.error(f"Error during Q&A: {e}")
                     st.session_state.qa_answer = "Could not generate an answer."
@@ -422,7 +460,7 @@ def jd_chatbot_content():
     st.header("🏢 JD Chatbot (Q&A)")
     st.markdown("### Ask questions about any saved Job Description.")
     
-    if not st.session_state.candidate_jd_list:
+    if not st.session_state.get('candidate_jd_list'):
         st.error("No Job Descriptions are currently loaded. Please add JDs in the 'JD Management' tab (Tab 4).")
         return
 
@@ -467,6 +505,16 @@ def jd_chatbot_content():
 # --- MAIN CANDIDATE DASHBOARD FUNCTION ---
 
 def candidate_dashboard():
+    # Initialize necessary session state variables if they don't exist
+    if 'parsed' not in st.session_state: st.session_state.parsed = {}
+    if 'full_text' not in st.session_state: st.session_state.full_text = ""
+    if 'candidate_jd_list' not in st.session_state: st.session_state.candidate_jd_list = []
+    if 'candidate_match_results' not in st.session_state: st.session_state.candidate_match_results = []
+    if 'filtered_jds_display' not in st.session_state: st.session_state.filtered_jds_display = []
+    if 'candidate_uploaded_resumes' not in st.session_state: st.session_state.candidate_uploaded_resumes = []
+    if 'pasted_cv_text' not in st.session_state: st.session_state.pasted_cv_text = ""
+
+
     st.header("👩‍🎓 Candidate Dashboard")
     st.markdown("Welcome! Use the tabs below to manage your CV and access AI preparation tools.")
 
@@ -490,7 +538,7 @@ def candidate_dashboard():
     tab_cv_mgmt, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "✍️ CV Management", 
         "📄 Resume Parsing", 
-        "💬 AI Chatbots", # Renamed tab for new sub-tabs
+        "💬 AI Chatbots", 
         "❓ Interview Prep", 
         "📚 JD Management", 
         "🎯 Batch JD Match",
@@ -518,13 +566,14 @@ def candidate_dashboard():
                 accept_multiple_files=False, key='candidate_file_upload_main'
             )
             
+            # Handle uploaded file change logic
             if uploaded_file is not None:
                 st.session_state.candidate_uploaded_resumes = [uploaded_file] 
                 st.session_state.pasted_cv_text = ""
             elif st.session_state.candidate_uploaded_resumes and uploaded_file is None:
+                # File was previously uploaded but removed
                 st.session_state.candidate_uploaded_resumes = []
-                st.session_state.parsed = {}
-                st.session_state.full_text = ""
+                # Don't clear parsed data immediately unless user clicks parse
             
             file_to_parse = st.session_state.candidate_uploaded_resumes[0] if st.session_state.candidate_uploaded_resumes else None
             
@@ -533,19 +582,24 @@ def candidate_dashboard():
             if file_to_parse:
                 if st.button(f"Parse and Load: **{file_to_parse.name}**", use_container_width=True):
                     with st.spinner(f"Parsing {file_to_parse.name}..."):
-                        result = parse_and_store_resume(file_to_parse, file_name_key='single_resume_candidate', source_type='file')
-                        
-                        if "error" not in result:
-                            st.session_state.parsed = result['parsed']
-                            st.session_state.full_text = result['full_text']
-                            st.session_state.excel_data = result['excel_data'] 
-                            st.session_state.parsed['name'] = result['name'] 
-                            clear_interview_state()
-                            st.success(f"✅ Successfully loaded and parsed **{result['name']}**.")
-                        else:
-                            st.error(f"Parsing failed for {file_to_parse.name}: {result['error']}")
-                            st.session_state.parsed = {"error": result['error'], "name": result['name']}
-                            st.session_state.full_text = result['full_text'] or ""
+                        try:
+                            result = parse_and_store_resume(file_to_parse, file_name_key='single_resume_candidate', source_type='file')
+                            
+                            if "error" not in result:
+                                st.session_state.parsed = result.get('parsed', {})
+                                st.session_state.full_text = result.get('full_text', "")
+                                st.session_state.excel_data = result.get('excel_data', None) 
+                                st.session_state.parsed['name'] = result.get('name', file_to_parse.name)
+                                clear_interview_state()
+                                st.success(f"✅ Successfully loaded and parsed **{st.session_state.parsed['name']}**.")
+                            else:
+                                st.error(f"Parsing failed for {file_to_parse.name}: {result['error']}")
+                                st.session_state.parsed = {"error": result['error'], "name": result.get('name', file_to_parse.name)}
+                                st.session_state.full_text = result.get('full_text', "")
+                        except NameError:
+                            st.error("Function 'parse_and_store_resume' not imported from 'app.py'. Check your setup.")
+                        except Exception as e:
+                            st.error(f"An unexpected error occurred during parsing: {e}")
             else:
                 st.info("No resume file is currently uploaded. Please upload a file above.")
 
@@ -567,19 +621,24 @@ def candidate_dashboard():
                     with st.spinner("Parsing pasted text..."):
                         st.session_state.candidate_uploaded_resumes = []
                         
-                        result = parse_and_store_resume(pasted_text, file_name_key='single_resume_candidate', source_type='text')
-                        
-                        if "error" not in result:
-                            st.session_state.parsed = result['parsed']
-                            st.session_state.full_text = result['full_text']
-                            st.session_state.excel_data = result['excel_data'] 
-                            st.session_state.parsed['name'] = result['name'] 
-                            clear_interview_state()
-                            st.success(f"✅ Successfully loaded and parsed **{result['name']}**.")
-                        else:
-                            st.error(f"Parsing failed: {result['error']}")
-                            st.session_state.parsed = {"error": result['error'], "name": result['name']}
-                            st.session_state.full_text = result['full_text'] or ""
+                        try:
+                            result = parse_and_store_resume(pasted_text, file_name_key='single_resume_candidate', source_type='text')
+                            
+                            if "error" not in result:
+                                st.session_state.parsed = result.get('parsed', {})
+                                st.session_state.full_text = result.get('full_text', "")
+                                st.session_state.excel_data = result.get('excel_data', None) 
+                                st.session_state.parsed['name'] = result.get('name', 'Pasted CV')
+                                clear_interview_state()
+                                st.success(f"✅ Successfully loaded and parsed **{st.session_state.parsed['name']}**.")
+                            else:
+                                st.error(f"Parsing failed: {result['error']}")
+                                st.session_state.parsed = {"error": result['error'], "name": result.get('name', 'Pasted CV')}
+                                st.session_state.full_text = result.get('full_text', "")
+                        except NameError:
+                            st.error("Function 'parse_and_store_resume' not imported from 'app.py'. Check your setup.")
+                        except Exception as e:
+                            st.error(f"An unexpected error occurred during parsing: {e}")
             else:
                 st.info("Please paste your CV text into the box above.")
 
@@ -601,7 +660,7 @@ def candidate_dashboard():
     # --- TAB 3: Interview Prep ---
     with tab3:
         st.header("Interview Preparation Tools")
-        if not is_resume_parsed or "error" in st.session_state.parsed:
+        if not is_resume_parsed or "error" in st.session_state.get('parsed', {}):
             st.warning("Please upload and successfully parse a resume first.")
         else:
             if 'iq_output' not in st.session_state: st.session_state.iq_output = ""
@@ -627,6 +686,7 @@ def candidate_dashboard():
                         st.session_state.interview_qa = [] 
                         st.session_state.evaluation_report = "" 
                         
+                        # Simple parsing of question response
                         q_list = []
                         current_level = ""
                         for line in raw_questions_response.splitlines():
@@ -643,6 +703,10 @@ def candidate_dashboard():
                         st.session_state.interview_qa = q_list
                         st.success(f"Generated {len(q_list)} questions based on your **{section_choice}** section.")
                         
+                    except NameError:
+                        st.error("Function 'generate_interview_questions' not imported from 'app.py'. Check your setup.")
+                        st.session_state.iq_output = "Error generating questions (Function Missing)."
+                        st.session_state.interview_qa = []
                     except Exception as e:
                         st.error(f"Error generating questions: {e}")
                         st.session_state.iq_output = "Error generating questions."
@@ -670,6 +734,9 @@ def candidate_dashboard():
                                     report = evaluate_interview_answers(st.session_state.interview_qa, st.session_state.parsed)
                                     st.session_state.evaluation_report = report
                                     st.success("Evaluation complete! See the report below.")
+                                except NameError:
+                                    st.error("Function 'evaluate_interview_answers' not imported from 'app.py'. Check your setup.")
+                                    st.session_state.evaluation_report = "Evaluation failed (Function Missing)."
                                 except Exception as e:
                                     st.error(f"Evaluation failed: {e}")
                                     st.session_state.evaluation_report = f"Evaluation failed: {e}\n{traceback.format_exc()}"
@@ -684,8 +751,6 @@ def candidate_dashboard():
     # --- TAB 4: JD Management (Candidate) ---
     with tab4:
         st.header("📚 Manage Job Descriptions for Matching")
-        
-        if "candidate_jd_list" not in st.session_state: st.session_state.candidate_jd_list = []
         
         jd_type = st.radio("Select JD Type", ["Single JD", "Multiple JD"], key="jd_type_candidate")
         st.markdown("### Add JD by:")
@@ -702,8 +767,13 @@ def candidate_dashboard():
                     for url in urls:
                         if not url: continue
                         with st.spinner(f"Attempting JD extraction and metadata analysis for: {url}"):
-                            jd_text = extract_jd_from_linkedin_url(url)
-                            metadata = extract_jd_metadata(jd_text)
+                            try:
+                                jd_text = extract_jd_from_linkedin_url(url)
+                                metadata = extract_jd_metadata(jd_text)
+                            except NameError:
+                                st.error("JD extraction functions not imported from 'app.py'. Check your setup.")
+                                break
+
                         
                         name_base = url.split('/jobs/view/')[-1].split('/')[0] if '/jobs/view/' in url else f"URL {count+1}"
                         name = f"JD from URL: {name_base}" 
@@ -714,7 +784,7 @@ def candidate_dashboard():
                         if not jd_text.startswith("[Error"): count += 1
                                 
                     if count > 0: st.success(f"✅ {count} JD(s) added successfully!")
-                    else: st.error("No JDs were added successfully.")
+                    elif urls: st.error("No JDs were added successfully. Check if the URL is valid and the extraction function is working.")
 
         # Paste Text
         elif method == "Paste Text":
@@ -722,14 +792,17 @@ def candidate_dashboard():
             if st.button("Add JD(s) from Text", key="add_jd_text_btn_candidate"):
                 if text_list:
                     texts = [t.strip() for t in text_list.split("---")] if jd_type == "Multiple JD" else [text_list.strip()]
-                    for i, text in enumerate(texts):
-                         if text:
-                            name_base = text.splitlines()[0].strip()
-                            if len(name_base) > 30: name_base = f"{name_base[:27]}..."
-                            if not name_base: name_base = f"Pasted JD {len(st.session_state.candidate_jd_list) + i + 1}"
-                            metadata = extract_jd_metadata(text)
-                            st.session_state.candidate_jd_list.append({"name": name_base, "content": text, **metadata})
-                    st.success(f"✅ {len(texts)} JD(s) added successfully!")
+                    try:
+                        for i, text in enumerate(texts):
+                             if text:
+                                name_base = text.splitlines()[0].strip()
+                                if len(name_base) > 30: name_base = f"{name_base[:27]}..."
+                                if not name_base: name_base = f"Pasted JD {len(st.session_state.candidate_jd_list) + i + 1}"
+                                metadata = extract_jd_metadata(text)
+                                st.session_state.candidate_jd_list.append({"name": name_base, "content": text, **metadata})
+                        st.success(f"✅ {len(texts)} JD(s) added successfully!")
+                    except NameError:
+                        st.error("Function 'extract_jd_metadata' not imported from 'app.py'. Check your setup.")
 
         # Upload File
         elif method == "Upload File":
@@ -740,13 +813,17 @@ def candidate_dashboard():
                 count = 0
                 for file in files_to_process:
                     if file:
-                        result = parse_and_store_resume(file, file_name_key='candidate_jd_temp', source_type='file')
-                        jd_text = result['full_text']
-                        if not jd_text.startswith("Error"):
-                            metadata = extract_jd_metadata(jd_text)
-                            st.session_state.candidate_jd_list.append({"name": file.name, "content": jd_text, **metadata})
-                            count += 1
-                        else: st.error(f"Error extracting content from {file.name}: {jd_text}")
+                        try:
+                            result = parse_and_store_resume(file, file_name_key='candidate_jd_temp', source_type='file')
+                            jd_text = result.get('full_text', "")
+                            if not jd_text.startswith("Error"):
+                                metadata = extract_jd_metadata(jd_text)
+                                st.session_state.candidate_jd_list.append({"name": file.name, "content": jd_text, **metadata})
+                                count += 1
+                            else: st.error(f"Error extracting content from {file.name}: {jd_text}")
+                        except NameError:
+                            st.error("Parsing/Metadata functions not imported from 'app.py'. Check your setup.")
+                            break
                             
                 if count > 0: st.success(f"✅ {count} JD(s) added successfully!")
                 elif uploaded_files: st.error("No valid JD files were uploaded or content extraction failed.")
@@ -761,7 +838,6 @@ def candidate_dashboard():
                     st.session_state.candidate_jd_list = []
                     st.session_state.candidate_match_results = []
                     st.session_state.filtered_jds_display = [] 
-                    st.success("All JDs and associated match results have been cleared.")
                     st.rerun() 
 
             for idx, jd_item in enumerate(st.session_state.candidate_jd_list, 1):
@@ -783,7 +859,6 @@ def candidate_dashboard():
         elif not st.session_state.candidate_jd_list:
             st.error("Please **add Job Descriptions** in the 'JD Management' tab before running batch analysis.")
         else:
-            if "candidate_match_results" not in st.session_state: st.session_state.candidate_match_results = []
 
             all_jd_names = [item['name'] for item in st.session_state.candidate_jd_list]
             selected_jd_names = st.multiselect("Select Job Descriptions to Match Against", options=all_jd_names, default=all_jd_names, key='candidate_batch_jd_select')
@@ -822,6 +897,10 @@ def candidate_dashboard():
                                     "skills_percent": skills_percent, "experience_percent": experience_percent, 
                                     "education_percent": education_percent, "full_analysis": fit_output
                                 })
+                            except NameError:
+                                st.error("Function 'evaluate_jd_fit' not imported from 'app.py'. Check your setup.")
+                                results_with_score.append({"jd_name": jd_name, "overall_score": "Error", "numeric_score": -1, "full_analysis": f"Error running analysis (Function Missing)"})
+                                break
                             except Exception as e:
                                 results_with_score.append({"jd_name": jd_name, "overall_score": "Error", "numeric_score": -1, "full_analysis": f"Error running analysis: {e}\n{traceback.format_exc()}"})
                                 
